@@ -1139,7 +1139,8 @@ int32_t Call::StartRecorder(int32_t dir, std::string path) {
 #ifndef DISABLE_RECORDER
   RTC_LOG(LS_INFO) << "Call::StartRecorder " << dir << " " << path;
 
-  if (path.rfind(".mkv") == std::string::npos) {
+  //if (path.rfind(".mkv") == std::string::npos) {
+  if (path.rfind(".mp4") == std::string::npos) {
     return -1;
   }
 

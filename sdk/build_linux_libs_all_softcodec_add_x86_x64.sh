@@ -2,10 +2,10 @@
 
 set -e
 
-export PATH=/home/ubuntu/project/hackwebrtc/src/third_party/llvm-build/Release+Asserts/bin:$PATH
+export PATH=/home/ubuntu/project/amazon-kvs-webrtc-ndk-c/src/third_party/llvm-build/Release+Asserts/bin:$PATH
 
-#PY=/home/ubuntu/project/hackwebrtc/depot_tools/python2-bin/python2
-#PY=/home/ubuntu/project/hackwebrtc/src/third_party/depot_tools/python2-bin/python2
+#PY=/home/ubuntu/project/amazon-kvs-webrtc-ndk-c/depot_tools/python2-bin/python2
+#PY=/home/ubuntu/project/amazon-kvs-webrtc-ndk-c/src/third_party/depot_tools/python2-bin/python2
 PY=python2
 
 pushd third_party/ffmpeg

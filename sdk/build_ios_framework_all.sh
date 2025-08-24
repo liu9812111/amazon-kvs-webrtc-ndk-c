@@ -15,22 +15,24 @@ git apply ../../sdk/ffmpeg-ios-build.diff
 
 python chromium/scripts/build_ffmpeg.py ios arm64 --branding Chrome -- \
     --disable-asm \
-    --disable-encoders --disable-hwaccels --disable-bsfs --disable-devices --disable-filters \
+    --disable-encoders --enable-encoder=h264 --enable-encoder=hevc \
+    --disable-hwaccels --disable-bsfs --disable-devices --disable-filters \
     --disable-protocols --enable-protocol=file \
     --disable-parsers --enable-parser=mpegaudio --enable-parser=h264 --enable-parser=hevc \
-    --disable-demuxers --enable-demuxer=mov --enable-demuxer=mp3 --enable-demuxer=mpegts \
-    --disable-decoders --enable-decoder=mp3 --enable-decoder=aac \
-    --disable-muxers --enable-muxer=matroska \
+    --disable-demuxers --enable-demuxer=mov --enable-demuxer=mp3 --enable-demuxer=mpegts --enable-demuxer=h264 --enable-demuxer=hevc \
+    --disable-decoders --enable-decoder=mp3 --enable-decoder=aac --enable-decoder=h264 --enable-decoder=hevc \
+    --disable-muxers --enable-muxer=matroska --enable-muxer=mp4 \
     --enable-swresample
 
 python chromium/scripts/build_ffmpeg.py ios x64 --branding Chrome -- \
     --disable-asm \
-    --disable-encoders --disable-hwaccels --disable-bsfs --disable-devices --disable-filters \
+    --disable-encoders --enable-encoder=h264 --enable-encoder=hevc \
+    --disable-hwaccels --disable-bsfs --disable-devices --disable-filters \
     --disable-protocols --enable-protocol=file \
     --disable-parsers --enable-parser=mpegaudio --enable-parser=h264 --enable-parser=hevc \
-    --disable-demuxers --enable-demuxer=mov --enable-demuxer=mp3 --enable-demuxer=mpegts \
-    --disable-decoders --enable-decoder=mp3 --enable-decoder=aac \
-    --disable-muxers --enable-muxer=matroska \
+    --disable-demuxers --enable-demuxer=mov --enable-demuxer=mp3 --enable-demuxer=mpegts --enable-demuxer=h264 --enable-demuxer=hevc \
+    --disable-decoders --enable-decoder=mp3 --enable-decoder=aac --enable-decoder=h264 --enable-decoder=hevc \
+    --disable-muxers --enable-muxer=matroska --enable-muxer=mp4 \
     --enable-swresample
 
 ./chromium/scripts/copy_config.sh
