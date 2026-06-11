@@ -6,11 +6,12 @@ on:
 jobs:
   build-ios:
     runs-on: macos-14
-
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
         with:
+          # 明确指定分支，避免在错误分支上触发导致 third_party/aac 缺失
+          ref: add-aac-softcodec-mp4recording
           fetch-depth: 1
 
       - name: 安装 Python 3.11 和 setuptools
@@ -39,8 +40,9 @@ jobs:
           target_os = ["ios"]
           GCLIENT_EOF
 
-      - name: 缓存 gclient 依赖
-        uses: actions/cache@v4
+      - name: 恢复 gclient 依赖缓存
+        id: cache-restore
+        uses: actions/cache/restore@v4
         with:
           path: /Users/runner/src/third_party
           key: gclient-ios-${{ hashFiles('DEPS') }}
@@ -50,58 +52,74 @@ jobs:
         run: |
           cd $HOME
           gclient sync --no-history --shallow --nohooks
-          # 修复 mac_toolchain.py
+          # 修复 mac_toolchain.py 在 Python 3.12+ 环境下 pkg_resources 缺失的问题
           python3 -c "
           path = '/Users/runner/src/build/mac_toolchain.py'
           with open(path) as f:
               content = f.read()
-          content = content.replace(
-              'import pkg_resources',
-              'try:\n    import pkg_resources\nexcept ImportError:\n    pkg_resources = None'
-          )
-          with open(path, 'w') as f:
-              f.write(content)
-          print('修复完成')
+          if 'except ImportError' not in content:
+              content = content.replace(
+                  'import pkg_resources',
+                  'try:\n    import pkg_resources\nexcept ImportError:\n    pkg_resources = None'
+              )
+              with open(path, 'w') as f:
+                  f.write(content)
+              print('mac_toolchain.py 修复完成')
+          else:
+              print('mac_toolchain.py 已修复过，跳过')
           "
           gclient runhooks
 
-      - name: 创建缺失的 third_party/aac 目录
-        run: |
-          # 把仓库里检出的代码复制到 gclient 的 src 目录
-          AAC_SRC="$GITHUB_WORKSPACE/third_party/aac"
-          AAC_DST="/Users/runner/src/third_party/aac"
-          if [ -d "$AAC_SRC" ]; then
-            echo "从仓库复制 aac 目录"
-            cp -r "$AAC_SRC" "$AAC_DST"
-          else
-            echo "仓库里没有 third_party/aac，创建空的 BUILD.gn"
-            mkdir -p "$AAC_DST"
-            touch "$AAC_DST/BUILD.gn"
-          fi
-          ls -la "$AAC_DST"
-
-      - name: 保存缓存（即使失败也保存）
-        if: always()
+      - name: 保存 gclient 依赖缓存（即使后续步骤失败也保存）
+        if: always() && steps.cache-restore.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: /Users/runner/src/third_party
           key: gclient-ios-${{ hashFiles('DEPS') }}
+
+      - name: 部署 third_party/aac
+        run: |
+          AAC_SRC="$GITHUB_WORKSPACE/third_party/aac"
+          AAC_DST="/Users/runner/src/third_party/aac"
+
+          # 关键：先删再建，避免缓存命中时 cp -r 把目录嵌套复制成 aac/aac/
+          rm -rf "$AAC_DST"
+          mkdir -p "$AAC_DST"
+
+          if [ -d "$AAC_SRC" ] && [ -f "$AAC_SRC/BUILD.gn" ]; then
+            echo "从仓库复制 aac 目录（含 BUILD.gn）"
+            cp -R "$AAC_SRC/." "$AAC_DST/"
+          else
+            echo "::warning::仓库里没有 third_party/aac/BUILD.gn，写入空的 rtc_aac 占位 target。"
+            echo "::warning::gn gen 可以通过，但如果代码真正用到 AAC 实现，编译/链接阶段仍会失败。"
+            cat > "$AAC_DST/BUILD.gn" <<'EOF'
+          group("rtc_aac") {
+          }
+          EOF
+          fi
+
+          echo "---- $AAC_DST 内容 ----"
+          ls -la "$AAC_DST"
+          echo "---- BUILD.gn 前 20 行 ----"
+          head -20 "$AAC_DST/BUILD.gn" || true
 
       - name: 编译 iOS XCFramework
         run: |
           export PATH="/opt/homebrew/opt/python@3.11/bin:$HOME/depot_tools:$PATH"
           export PYTHONPATH="$HOME/depot_tools"
           cd /Users/runner/src
+          # 注意：不要随便传 --extra-gn-args "rtc_build_aac=false"，
+          # 除非你的 GN 代码里用 declare_args() 声明过这个参数，否则 gn gen 会直接报错。
           python3.11 tools_webrtc/ios/build_ios_libs.py \
             --output out/ios-release \
             --arch arm64 \
-            --build_config release \
-            --extra-gn-args "rtc_build_aac=false"
+            --build_config release
 
       - name: 打包成 zip
         run: |
           cd /Users/runner/src
-          zip -r $GITHUB_WORKSPACE/WebRTC.xcframework.zip out/ios-release/WebRTC.xcframework
+          ls -la out/ios-release
+          zip -ry $GITHUB_WORKSPACE/WebRTC.xcframework.zip out/ios-release/WebRTC.xcframework
 
       - name: 上传为 Artifact（可下载）
         uses: actions/upload-artifact@v4
