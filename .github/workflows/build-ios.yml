@@ -77,7 +77,7 @@ jobs:
           path: /Users/runner/src/third_party
           key: gclient-ios-${{ hashFiles('DEPS') }}
 
-      - name: 部署 third_party/aac
+      - name: 部署 third_party/aac（fdk-aac + BUILD.gn）
         run: |
           AAC_SRC="$GITHUB_WORKSPACE/third_party/aac"
           AAC_DST="/Users/runner/src/third_party/aac"
@@ -90,18 +90,47 @@ jobs:
             echo "从仓库复制 aac 目录（含 BUILD.gn）"
             cp -R "$AAC_SRC/." "$AAC_DST/"
           else
-            echo "::warning::仓库里没有 third_party/aac/BUILD.gn，写入空的 rtc_aac 占位 target。"
-            echo "::warning::gn gen 可以通过，但如果代码真正用到 AAC 实现，编译/链接阶段仍会失败。"
-            cat > "$AAC_DST/BUILD.gn" <<'EOF'
-          group("rtc_aac") {
-          }
-          EOF
+            echo "仓库里没有 third_party/aac，自动拉取 fdk-aac 源码并生成 BUILD.gn"
+            git clone --depth=1 https://github.com/mstorsjo/fdk-aac.git "$AAC_DST/fdk-aac"
+            rm -rf "$AAC_DST/fdk-aac/.git"
+
+            cd "$AAC_DST"
+            {
+              echo 'config("aac_includes") {'
+              echo '  include_dirs = ['
+              for d in fdk-aac/lib*/include; do
+                echo "    \"$d\","
+              done
+              echo '    "fdk-aac",'
+              echo '    ".",'
+              echo '  ]'
+              echo '}'
+              echo ''
+              echo '# 注意：target 名必须是 "aac"，'
+              echo '# 对应 //modules/audio_coding:webrtc_aac 依赖的 //third_party/aac:aac'
+              echo 'static_library("aac") {'
+              echo '  sources = ['
+              find fdk-aac -path '*/src/*.cpp' | sort | sed 's|^|    "|; s|$|",|'
+              echo '  ]'
+              echo '  public_configs = [ ":aac_includes" ]'
+              echo '  configs -= [ "//build/config/compiler:chromium_code" ]'
+              echo '  configs += [ "//build/config/compiler:no_chromium_code" ]'
+              echo '  # fdk-aac 是第三方代码，关闭所有告警避免被 -Werror 打断'
+              echo '  cflags = [ "-w" ]'
+              echo '  cflags_cc = [ "-w" ]'
+              echo '}'
+              echo ''
+              echo '# 兼容别名，防止其他地方引用 rtc_aac'
+              echo 'group("rtc_aac") {'
+              echo '  public_deps = [ ":aac" ]'
+              echo '}'
+            } > BUILD.gn
           fi
 
           echo "---- $AAC_DST 内容 ----"
           ls -la "$AAC_DST"
-          echo "---- BUILD.gn 前 20 行 ----"
-          head -20 "$AAC_DST/BUILD.gn" || true
+          echo "---- BUILD.gn 前 40 行 ----"
+          head -40 "$AAC_DST/BUILD.gn" || true
 
       - name: 编译 iOS XCFramework
         run: |
