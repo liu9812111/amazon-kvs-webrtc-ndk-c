@@ -132,17 +132,38 @@ jobs:
           echo "---- BUILD.gn 前 40 行 ----"
           head -40 "$AAC_DST/BUILD.gn" || true
 
+      - name: 升级 clang 工具链（兼容 Xcode 15 SDK）
+        run: |
+          cd /Users/runner/src
+          echo "当前 clang 版本："
+          third_party/llvm-build/Release+Asserts/bin/clang --version || true
+
+          # 本分支 pin 的 chromium clang 16（约 M114）只支持到 Xcode 14.3，
+          # 而 runner 上只有 Xcode 15.x，会导致 SDK 系统头文件编译报错。
+          # 用 M118（首个官方支持 Xcode 15 的里程碑，branch-heads/5993）的
+          # update.py 下载对应的 clang 17 预编译包，覆盖旧工具链。
+          curl -fsSL "https://chromium.googlesource.com/chromium/src/+/refs/branch-heads/5993/tools/clang/scripts/update.py?format=TEXT" \
+            | python3 -c "import base64,sys;sys.stdout.buffer.write(base64.b64decode(sys.stdin.read()))" \
+            > /tmp/clang_update.py
+
+          rm -rf third_party/llvm-build
+          python3.11 /tmp/clang_update.py --output-dir third_party/llvm-build/Release+Asserts
+
+          echo "替换后 clang 版本："
+          third_party/llvm-build/Release+Asserts/bin/clang --version
+
       - name: 编译 iOS XCFramework
         run: |
           export PATH="/opt/homebrew/opt/python@3.11/bin:$HOME/depot_tools:$PATH"
           export PYTHONPATH="$HOME/depot_tools"
           cd /Users/runner/src
-          # 注意：不要随便传 --extra-gn-args "rtc_build_aac=false"，
-          # 除非你的 GN 代码里用 declare_args() 声明过这个参数，否则 gn gen 会直接报错。
+          # treat_warnings_as_errors=false：新版 clang 会对旧代码报一些新告警，
+          # 关掉 -Werror 避免被无关告警打断
           python3.11 tools_webrtc/ios/build_ios_libs.py \
             --output out/ios-release \
             --arch arm64 \
-            --build_config release
+            --build_config release \
+            --extra-gn-args "treat_warnings_as_errors=false"
 
       - name: 打包成 zip
         run: |
