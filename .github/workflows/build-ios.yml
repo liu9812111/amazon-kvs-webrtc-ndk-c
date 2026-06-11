@@ -95,7 +95,8 @@ jobs:
           python3.11 tools_webrtc/ios/build_ios_libs.py \
             --output out/ios-release \
             --arch arm64 \
-            --build_config release
+            --build_config release \
+            --extra-gn-args "rtc_build_aac=false"
 
       - name: 打包成 zip
         run: |
