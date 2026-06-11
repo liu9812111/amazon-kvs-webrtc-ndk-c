@@ -149,6 +149,15 @@ jobs:
           rm -rf third_party/llvm-build
           python3.11 /tmp/clang_update.py --output-dir third_party/llvm-build/Release+Asserts
 
+          # 关键：gn gen 会用源码树里的 tools/clang/scripts/update.py 做版本自检，
+          # 旧脚本写死了期望 clang 16，必须一并替换成 M118 的脚本
+          cp /tmp/clang_update.py tools/clang/scripts/update.py
+
+          # GN 配置里写死的 clang 版本号也要从 16.0.0 改成 17（clang 17 的资源目录是主版本号）
+          sed -i '' -E 's/clang_version = "16[0-9.]*"/clang_version = "17"/' build/toolchain/toolchain.gni
+          echo "---- toolchain.gni 中的 clang_version ----"
+          grep -n 'clang_version' build/toolchain/toolchain.gni || true
+
           echo "替换后 clang 版本："
           third_party/llvm-build/Release+Asserts/bin/clang --version
 
