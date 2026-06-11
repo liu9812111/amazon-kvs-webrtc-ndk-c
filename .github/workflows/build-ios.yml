@@ -40,6 +40,7 @@ jobs:
 
       - name: 缓存 gclient 依赖
         uses: actions/cache@v4
+        id: gclient-cache
         with:
           path: |
             ${{ github.workspace }}/../.cipd
@@ -51,7 +52,6 @@ jobs:
         run: |
           cd $GITHUB_WORKSPACE/..
           gclient sync --no-history --shallow --nohooks
-          # 自动找到 mac_toolchain.py 并修复
           TOOLCHAIN=$(find /Users/runner/work -name "mac_toolchain.py" 2>/dev/null | head -1)
           echo "找到文件: $TOOLCHAIN"
           python3 -c "
@@ -69,12 +69,24 @@ jobs:
           " "$TOOLCHAIN"
           gclient runhooks
 
+      - name: 保存缓存（即使失败也保存）
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ${{ github.workspace }}/../.cipd
+            ${{ github.workspace }}/../third_party
+          key: gclient-ios-${{ hashFiles('DEPS') }}
+
       - name: 编译 iOS XCFramework
         run: |
           export PATH="$HOME/depot_tools:$PATH"
-          export PYTHONPATH="$HOME/depot_tools:$PYTHONPATH"
+          export PYTHONPATH="$HOME/depot_tools"
           cd $GITHUB_WORKSPACE
-          python3 tools_webrtc/ios/build_ios_libs.py \
+          # 验证 find_depot_tools 能找到
+          python3 -c "import sys; sys.path.insert(0,'$HOME/depot_tools'); import find_depot_tools; print('find_depot_tools OK')"
+          # 用 PYTHONPATH 运行编译脚本
+          PYTHONPATH="$HOME/depot_tools" python3 tools_webrtc/ios/build_ios_libs.py \
             --output out/ios-release \
             --arch arm64 \
             --build_config release
