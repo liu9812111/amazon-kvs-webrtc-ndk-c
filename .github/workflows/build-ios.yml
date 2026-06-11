@@ -13,10 +13,6 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: 修复 Python 环境
-        run: |
-          pip3 install setuptools --break-system-packages || pip3 install setuptools
-
       - name: 安装 depot_tools
         run: |
           git clone --depth=1 https://chromium.googlesource.com/chromium/tools/depot_tools.git $HOME/depot_tools
@@ -47,10 +43,27 @@ jobs:
           key: gclient-ios-${{ hashFiles('DEPS') }}
           restore-keys: gclient-ios-
 
-      - name: 同步依赖 (gclient sync)
+      - name: 同步依赖 (gclient sync，不执行 hooks)
         run: |
           cd $GITHUB_WORKSPACE/..
           gclient sync --no-history --shallow --nohooks
+
+      - name: 修复 mac_toolchain.py 的 pkg_resources 问题
+        run: |
+          # 给所有 Python 版本都装上 setuptools
+          for py in $(find /usr/local/bin /usr/bin /opt/homebrew/bin -name "python3*" -type f 2>/dev/null); do
+            $py -m pip install setuptools --quiet --break-system-packages 2>/dev/null || \
+            $py -m pip install setuptools --quiet 2>/dev/null || true
+          done
+          # 直接在 mac_toolchain.py 顶部加兼容代码
+          TOOLCHAIN_FILE="$GITHUB_WORKSPACE/build/mac_toolchain.py"
+          if [ -f "$TOOLCHAIN_FILE" ]; then
+            sed -i '' 's/import pkg_resources/try:\n    import pkg_resources\nexcept ImportError:\n    import importlib.metadata as pkg_resources/' "$TOOLCHAIN_FILE" || true
+          fi
+
+      - name: 执行 gclient runhooks
+        run: |
+          cd $GITHUB_WORKSPACE/..
           gclient runhooks
 
       - name: 编译 iOS XCFramework
