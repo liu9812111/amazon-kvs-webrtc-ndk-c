@@ -51,10 +51,12 @@ jobs:
         run: |
           cd $GITHUB_WORKSPACE/..
           gclient sync --no-history --shallow --nohooks
-          # 修复下载下来的 mac_toolchain.py
-          TOOLCHAIN="$GITHUB_WORKSPACE/build/mac_toolchain.py"
+          # 自动找到 mac_toolchain.py 并修复
+          TOOLCHAIN=$(find /Users/runner/work -name "mac_toolchain.py" 2>/dev/null | head -1)
+          echo "找到文件: $TOOLCHAIN"
           python3 -c "
-          path = '$TOOLCHAIN'
+          import sys
+          path = sys.argv[1]
           with open(path) as f:
               content = f.read()
           content = content.replace(
@@ -64,7 +66,7 @@ jobs:
           with open(path, 'w') as f:
               f.write(content)
           print('修复完成:', path)
-          "
+          " "$TOOLCHAIN"
           gclient runhooks
 
       - name: 编译 iOS XCFramework
