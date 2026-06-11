@@ -1,0 +1,68 @@
+name: Build iOS XCFramework
+
+on:
+  workflow_dispatch:  # 允许手动触发
+
+jobs:
+  build-ios:
+    runs-on: macos-14  # 使用 macOS 编译机
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 安装 depot_tools
+        run: |
+          git clone --depth=1 https://chromium.googlesource.com/chromium/tools/depot_tools.git $HOME/depot_tools
+          echo "$HOME/depot_tools" >> $GITHUB_PATH
+
+      - name: 写入 gclient 配置
+        run: |
+          cd $GITHUB_WORKSPACE/..
+          cat > .gclient << 'GCLIENT_EOF'
+          solutions = [
+            {
+              "name": "src",
+              "url": "https://github.com/liu9812111/amazon-kvs-webrtc-ndk-c.git@add-aac-softcodec-mp4recording",
+              "deps_file": "DEPS",
+              "managed": False,
+              "custom_vars": {},
+            },
+          ]
+          target_os = ["ios"]
+          GCLIENT_EOF
+
+      - name: 缓存 gclient 依赖
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ github.workspace }}/../.cipd
+            ${{ github.workspace }}/../third_party
+          key: gclient-ios-${{ hashFiles('DEPS') }}
+          restore-keys: gclient-ios-
+
+      - name: 同步依赖 (gclient sync)
+        run: |
+          cd $GITHUB_WORKSPACE/..
+          gclient sync --no-history --shallow --nohooks
+          gclient runhooks
+
+      - name: 编译 iOS XCFramework
+        run: |
+          python3 tools_webrtc/ios/build_ios_libs.py \
+            --output out/ios-release \
+            --arch arm64 \
+            --build_config release
+
+      - name: 打包成 zip
+        run: |
+          zip -r WebRTC.xcframework.zip out/ios-release/WebRTC.xcframework
+
+      - name: 上传为 Artifact（可下载）
+        uses: actions/upload-artifact@v4
+        with:
+          name: WebRTC-iOS-XCFramework
+          path: WebRTC.xcframework.zip
+          retention-days: 30
