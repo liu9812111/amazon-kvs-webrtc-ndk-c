@@ -1,17 +1,21 @@
 name: Build iOS XCFramework
 
 on:
-  workflow_dispatch:  # 允许手动触发
+  workflow_dispatch:
 
 jobs:
   build-ios:
-    runs-on: macos-14  # 使用 macOS 编译机
+    runs-on: macos-14
 
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
+
+      - name: 修复 Python 环境
+        run: |
+          pip3 install setuptools --break-system-packages || pip3 install setuptools
 
       - name: 安装 depot_tools
         run: |
