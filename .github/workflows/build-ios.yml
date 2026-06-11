@@ -24,7 +24,7 @@ jobs:
 
       - name: 写入 gclient 配置
         run: |
-          cd $GITHUB_WORKSPACE/..
+          cd $HOME
           cat > .gclient << 'GCLIENT_EOF'
           solutions = [
             {
@@ -40,19 +40,18 @@ jobs:
 
       - name: 缓存 gclient 依赖
         uses: actions/cache@v4
-        id: gclient-cache
         with:
           path: |
-            ${{ github.workspace }}/../.cipd
-            ${{ github.workspace }}/../third_party
+            ${{ env.HOME }}/.cipd
+            ${{ env.HOME }}/src/third_party
           key: gclient-ios-${{ hashFiles('DEPS') }}
           restore-keys: gclient-ios-
 
       - name: 同步依赖并修复后执行 hooks
         run: |
-          cd $GITHUB_WORKSPACE/..
+          cd $HOME
           gclient sync --no-history --shallow --nohooks
-          TOOLCHAIN=$(find /Users/runner/work -name "mac_toolchain.py" 2>/dev/null | head -1)
+          TOOLCHAIN=$(find $HOME/src/build -name "mac_toolchain.py" 2>/dev/null | head -1)
           echo "找到文件: $TOOLCHAIN"
           python3 -c "
           import sys
@@ -74,18 +73,14 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: |
-            ${{ github.workspace }}/../.cipd
-            ${{ github.workspace }}/../third_party
+            ${{ env.HOME }}/.cipd
+            ${{ env.HOME }}/src/third_party
           key: gclient-ios-${{ hashFiles('DEPS') }}
 
       - name: 编译 iOS XCFramework
         run: |
           export PATH="$HOME/depot_tools:$PATH"
-          export PYTHONPATH="$HOME/depot_tools"
-          cd $GITHUB_WORKSPACE
-          # 验证 find_depot_tools 能找到
-          python3 -c "import sys; sys.path.insert(0,'$HOME/depot_tools'); import find_depot_tools; print('find_depot_tools OK')"
-          # 用 PYTHONPATH 运行编译脚本
+          cd $HOME/src
           PYTHONPATH="$HOME/depot_tools" python3 tools_webrtc/ios/build_ios_libs.py \
             --output out/ios-release \
             --arch arm64 \
@@ -93,7 +88,8 @@ jobs:
 
       - name: 打包成 zip
         run: |
-          zip -r WebRTC.xcframework.zip out/ios-release/WebRTC.xcframework
+          cd $HOME/src
+          zip -r $GITHUB_WORKSPACE/WebRTC.xcframework.zip out/ios-release/WebRTC.xcframework
 
       - name: 上传为 Artifact（可下载）
         uses: actions/upload-artifact@v4
