@@ -15,7 +15,8 @@ jobs:
 
       - name: 安装 Python setuptools
         run: |
-          python3 -m pip install setuptools --break-system-packages
+          brew install python@3.11
+          python3.11 -m pip install setuptools --break-system-packages
 
       - name: 安装 depot_tools
         run: |
@@ -77,11 +78,27 @@ jobs:
             ${{ env.HOME }}/src/third_party
           key: gclient-ios-${{ hashFiles('DEPS') }}
 
+      - name: 环境诊断
+        run: |
+          echo "=== GITHUB_WORKSPACE ==="
+          echo $GITHUB_WORKSPACE
+          echo "=== HOME ==="
+          echo $HOME
+          echo "=== 工作目录结构 ==="
+          ls /Users/runner/work/amazon-kvs-webrtc-ndk-c/
+          echo "=== find_depot_tools.py 在哪 ==="
+          find /Users/runner -name "find_depot_tools.py" 2>/dev/null
+          echo "=== build_ios_libs.py 在哪 ==="
+          find /Users/runner -name "build_ios_libs.py" 2>/dev/null
+          echo "=== mac_toolchain.py 在哪 ==="
+          find /Users/runner -name "mac_toolchain.py" 2>/dev/null
+
       - name: 编译 iOS XCFramework
         run: |
-          export PATH="$HOME/depot_tools:$PATH"
+          export PATH="/opt/homebrew/opt/python@3.11/bin:$HOME/depot_tools:$PATH"
+          export PYTHONPATH="$HOME/depot_tools"
           cd $HOME/src
-          PYTHONPATH="$HOME/depot_tools" python3 tools_webrtc/ios/build_ios_libs.py \
+          python3.11 tools_webrtc/ios/build_ios_libs.py \
             --output out/ios-release \
             --arch arm64 \
             --build_config release
