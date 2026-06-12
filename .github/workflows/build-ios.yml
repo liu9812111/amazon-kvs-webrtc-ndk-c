@@ -164,6 +164,29 @@ jobs:
           echo "替换后 clang 版本："
           third_party/llvm-build/Release+Asserts/bin/clang --version
 
+      - name: 生成 FFmpeg iOS 配置头文件（avconfig.h）
+        run: |
+          FFMPEG_SRC="/Users/runner/src/third_party/ffmpeg"
+          FFMPEG_OUT="/Users/runner/src/out/ffmpeg-ios-config"
+          mkdir -p "$FFMPEG_OUT"
+
+          cd "$FFMPEG_SRC"
+
+          # 手动生成 avconfig.h（最简单可靠的方案：直接写入）
+          # 无需完整 configure，avconfig.h 内容在 iOS arm64 下是固定的
+          mkdir -p "$FFMPEG_SRC/libavutil"
+          cat > "$FFMPEG_SRC/libavutil/avconfig.h" << 'EOF'
+          /* Generated for iOS arm64 */
+          #ifndef AVUTIL_AVCONFIG_H
+          #define AVUTIL_AVCONFIG_H
+          #define AV_HAVE_BIGENDIAN 0
+          #define AV_HAVE_FAST_UNALIGNED 1
+          #endif /* AVUTIL_AVCONFIG_H */
+          EOF
+
+          echo "---- avconfig.h 内容 ----"
+          cat "$FFMPEG_SRC/libavutil/avconfig.h"
+
       - name: 编译 iOS XCFramework
         run: |
           export PATH="/opt/homebrew/opt/python@3.11/bin:$HOME/depot_tools:$PATH"
