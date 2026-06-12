@@ -226,55 +226,86 @@ jobs:
           #         iOS arm64 只命中 (is_mac||is_ios)&&arm64 及无 cpu 限定的基础分支，
           #         等价于 mac/arm64 的源集合。
           python3 - << 'PYEOF'
-          import sys, re
-          p = "/Users/runner/src/third_party/ffmpeg/ffmpeg_generated.gni"
+          import sys, re, os
+          ff = "/Users/runner/src/third_party/ffmpeg"
+          p = os.path.join(ff, "ffmpeg_generated.gni")
           s = open(p).read()
           before = s.count("is_ios")
-          # 只替换作为独立标识符的 is_mac（避免碰到已经是 is_ios 之类），
-          # gni 是自动生成的纯条件文件，is_mac 只出现在 if 条件里。
+          # iOS 复用 mac 源列表
           s2 = re.sub(r'\bis_mac\b', '(is_mac || is_ios)', s)
-          # 防止重复包裹：把可能产生的 (is_(is_mac || is_ios)) 之类不会发生，
-          # 因为 \bis_mac\b 精确匹配标识符边界。
 
-          # 追加 libswresample + audio_fifo（Chromium 版默认裁掉，但 backing_track 需要）
-          # 源清单依据 libswresample/Makefile 的 OBJS（排除 template/data/soxr/shared 专用）
-          extra = '''
-
-          # ---- 手动补入 libswresample 与 audio_fifo（backing_track 依赖）----
-          ffmpeg_c_sources += [
-            "libavutil/audio_fifo.c",
-            "libswresample/audioconvert.c",
-            "libswresample/dither.c",
-            "libswresample/options.c",
-            "libswresample/rematrix.c",
-            "libswresample/resample.c",
-            "libswresample/resample_dsp.c",
-            "libswresample/swresample.c",
-            "libswresample/swresample_frame.c",
-            "libswresample/version.c",
+          # libswresample + audio_fifo：Chromium 版默认裁掉，backing_track 需要。
+          # 用 autorename 包装文件避免 object 重名冲突（options.c/version.c/resample.c
+          # 等与 libavcodec/libavformat 里同名文件会映射到同一个 .o）。
+          # 包装文件放在 ffmpeg 根目录，文件名带库名前缀，object 名唯一。
+          base_srcs = [
+              "libavutil/audio_fifo.c",
+              "libswresample/audioconvert.c",
+              "libswresample/dither.c",
+              "libswresample/options.c",
+              "libswresample/rematrix.c",
+              "libswresample/resample.c",
+              "libswresample/resample_dsp.c",
+              "libswresample/swresample.c",
+              "libswresample/swresample_frame.c",
+              "libswresample/version.c",
           ]
-          if ((is_mac || is_ios) && current_cpu == "arm64") {
-            ffmpeg_c_sources += [
+          arm_srcs = [
               "libswresample/aarch64/audio_convert_init.c",
               "libswresample/aarch64/resample_init.c",
-            ]
-          }
-          '''
+          ]
+
+          def make_wrapper(rel):
+              # rel 形如 libswresample/options.c -> autorename_libswresample_options.c
+              flat = rel.replace("/", "_")
+              wrapper_name = "autorename_" + flat
+              wrapper_path = os.path.join(ff, wrapper_name)
+              with open(wrapper_path, "w") as w:
+                  w.write('#include "%s"\n' % rel)
+              return wrapper_name
+
+          base_wrappers = [make_wrapper(r) for r in base_srcs]
+          arm_wrappers = [make_wrapper(r) for r in arm_srcs]
+
+          # 逐行构造，所有 GN 行顶格（无前导缩进），避免 heredoc 缩进混入 gni。
+          lines = []
+          lines.append("")
+          lines.append("# ---- 手动补入 libswresample 与 audio_fifo（autorename 包装，避免 .o 重名）----")
+          lines.append("ffmpeg_c_sources += [")
+          for w in base_wrappers:
+              lines.append('  "%s",' % w)
+          lines.append("]")
+          lines.append('if ((is_mac || is_ios) && current_cpu == "arm64") {')
+          lines.append("  ffmpeg_c_sources += [")
+          for w in arm_wrappers:
+              lines.append('    "%s",' % w)
+          lines.append("  ]")
+          lines.append("}")
+          lines.append("")
+          extra = "\n".join(lines)
+
+          # 确保原文末尾有换行再追加
+          if not s2.endswith("\n"):
+              s2 += "\n"
           s2 = s2 + extra
           open(p, "w").write(s2)
+
           after_ios = open(p).read().count("is_ios")
           if after_ios <= before:
-              print("❌ gni 未发生替换，结构可能已变，中止")
-              sys.exit(1)
-          if "libswresample/swresample.c" not in open(p).read():
-              print("❌ swresample 源未写入，中止")
-              sys.exit(1)
-          print(f"✅ gni 已补 iOS 源列表 + swresample/audio_fifo（is_ios 引用 {after_ios - before} 处）")
+              print("❌ gni 未发生替换，中止"); sys.exit(1)
+          if "autorename_libswresample_swresample.c" not in open(p).read():
+              print("❌ swresample 包装未写入，中止"); sys.exit(1)
+          # 校验包装文件确实生成
+          if not os.path.exists(os.path.join(ff, "autorename_libswresample_options.c")):
+              print("❌ 包装文件未生成，中止"); sys.exit(1)
+          print(f"✅ gni 已补 iOS 源 + swresample/audio_fifo（autorename 包装 {len(base_wrappers)+len(arm_wrappers)} 个）")
           PYEOF
-          echo "---- 确认 gni 现在有 is_ios 分支 ----"
+          echo "---- 确认 gni 有 is_ios ----"
           grep -c 'is_ios' "$FF/ffmpeg_generated.gni"
-          echo "---- 确认 swresample 已补入 ----"
-          grep -c 'libswresample' "$FF/ffmpeg_generated.gni"
+          echo "---- 确认 autorename 包装已引用 ----"
+          grep -c 'autorename_libswresample' "$FF/ffmpeg_generated.gni"
+          echo "---- 生成的包装文件 ----"
+          ls -1 "$FF"/autorename_libswresample_*.c "$FF"/autorename_libavutil_audio_fifo.c 2>/dev/null
 
           echo ""
           echo "########## 修复2a-0b: 启用 CONFIG_SWRESAMPLE（config.h 默认是 0）##########"
