@@ -102,9 +102,16 @@ jobs:
           aac_dst = sys.argv[1]
           fdk_root = os.path.join(aac_dst, "fdk-aac")
 
+          print("---- fdk-aac 所有子目录 ----")
+          for dirpath, dirnames, filenames in os.walk(fdk_root):
+              rel = os.path.relpath(dirpath, fdk_root)
+              cpp_count = len([f for f in filenames if f.endswith(".cpp")])
+              if cpp_count > 0:
+                  print(f"  {rel}  ({cpp_count} .cpp)") 
+
           # 收集所有 .cpp，只取各库 src/ 目录下的顶层文件
           # 排除所有平台特定子目录（arm/mips/x86/win32 等）
-          excluded_dirs = {"arm", "win32", "x86", "fuzzer", "mips", "aarch64"}
+          excluded_dirs = {"arm", "win32", "x86", "fuzzer", "mips", "aarch64", "tests", "benchmark"}
           sources = []
           for dirpath, dirnames, filenames in os.walk(fdk_root):
               # 剔除路径中包含任何排除目录名的路径
