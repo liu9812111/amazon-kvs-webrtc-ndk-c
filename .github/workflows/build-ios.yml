@@ -92,12 +92,13 @@ jobs:
             cp -R "$AAC_SRC/." "$AAC_DST/"
           fi
 
-          # 收集所有 .cpp，但排除 arm/ win32/ x86/ 目录下的平台特定优化文件
-          # 这些文件依赖平台汇编宏（FIXP_DBL 等），在 chromium 的 GN 构建环境下
-          # 缺少正确的头文件依赖链，会导致编译报错
+          echo "---- 验证关键头文件是否存在 ----"
+          ls "$AAC_DST/fdk-aac/libFDK/include/machine_type.h" && echo "✅ 存在" || echo "❌ 不存在"
+          ls "$AAC_DST/fdk-aac/libAACenc/include/aacenc_lib.h" && echo "✅ 存在" || echo "❌ 不存在"
+
+          # 收集所有 .cpp，排除平台特定优化文件
           SOURCES=""
           while IFS= read -r f; do
-            # 转为相对于 BUILD.gn 所在目录的路径
             rel="${f#$AAC_DST/}"
             SOURCES="${SOURCES}    \"${rel}\",\n"
           done < <(find "$AAC_DST/fdk-aac" -name "*.cpp" \
@@ -106,42 +107,51 @@ jobs:
                     ! -path "*/x86/*" \
                     | sort)
 
-          cat > "$AAC_DST/BUILD.gn" << GNGEOF
-          config("aac_includes") {
-            include_dirs = [
-              "fdk-aac/libAACdec/include",
-              "fdk-aac/libAACenc/include",
-              "fdk-aac/libArithCoding/include",
-              "fdk-aac/libDRCdec/include",
-              "fdk-aac/libFDK/include",
-              "fdk-aac/libMpegTPDec/include",
-              "fdk-aac/libMpegTPEnc/include",
-              "fdk-aac/libPCMutils/include",
-              "fdk-aac/libSACdec/include",
-              "fdk-aac/libSACenc/include",
-              "fdk-aac/libSBRdec/include",
-              "fdk-aac/libSBRenc/include",
-              ".",
-            ]
-          }
-
+          # 注意：用单引号 'GNGEOF' 防止 shell 展开 $SOURCES 以外的内容
+          # $SOURCES 通过 printf 单独插入
+          cat > "$AAC_DST/BUILD.gn" << 'GNGEOF'
+             config("aac_includes") {
+               include_dirs = [
+                 "fdk-aac",
+                 "fdk-aac/libAACdec/include",
+                 "fdk-aac/libAACenc/include",
+                 "fdk-aac/libArithCoding/include",
+                 "fdk-aac/libDRCdec/include",
+                 "fdk-aac/libFDK/include",
+                 "fdk-aac/libMpegTPDec/include",
+                 "fdk-aac/libMpegTPEnc/include",
+                 "fdk-aac/libPCMutils/include",
+                 "fdk-aac/libSACdec/include",
+                 "fdk-aac/libSACenc/include",
+                 "fdk-aac/libSBRdec/include",
+                 "fdk-aac/libSBRenc/include",
+                 ".",
+               ]
+             }
+             
           static_library("aac") {
-            sources = [
-          $(printf "$SOURCES")
-            ]
-            defines = [ "SUPPRESS_BUILD_DATE_INFO" ]
-            public_configs = [ ":aac_includes" ]
-            configs -= [ "//build/config/compiler:chromium_code" ]
-            configs += [ "//build/config/compiler:no_chromium_code" ]
-            cflags = [ "-w" ]
-            cflags_cc = [ "-w" ]
-          }
+               sources = [
+             SOURCES_PLACEHOLDER
+               ]
+               defines = [ "SUPPRESS_BUILD_DATE_INFO" ]
+               public_configs = [ ":aac_includes" ]
+               configs -= [ "//build/config/compiler:chromium_code" ]
+               configs += [ "//build/config/compiler:no_chromium_code" ]
+               cflags = [ "-w" ]
+               cflags_cc = [ "-w" ]
+             }
+             
+             group("rtc_aac") {
+               public_deps = [ ":aac" ]
+             }
+             GNGEOF
 
-          group("rtc_aac") {
-            public_deps = [ ":aac" ]
-          }
-          GNGEOF
+          # 把占位符替换成真实的 sources 列表
+          printf "$SOURCES" > /tmp/aac_sources.txt
+          sed -i '' "s|SOURCES_PLACEHOLDER|$(cat /tmp/aac_sources.txt)|" "$AAC_DST/BUILD.gn"
 
+          echo "---- $AAC_DST 内容 ----"
+          ls -la "$AAC_DST"
           echo "---- sources 数量 ----"
           grep -c '\.cpp' "$AAC_DST/BUILD.gn" || true
           echo "---- BUILD.gn 前 50 行 ----"
