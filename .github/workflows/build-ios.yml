@@ -287,6 +287,40 @@ jobs:
           grep -n 'link_target_type =' "$FF/BUILD.gn"
 
           echo ""
+          echo "########## 修复2a-3: 给 iOS 也加 _DARWIN_C_SOURCE ##########"
+          # ffmpeg cpu.c 包含 <sys/sysctl.h> -> sys/proc.h/ucred.h，用到 u_int/u_char
+          # 等 BSD 类型，这些类型只有定义 _DARWIN_C_SOURCE 才暴露。
+          # BUILD.gn 里只有 if (is_mac) 分支加了它，iOS(is_mac=false) 没拿到 -> 编译报错。
+          # 修法：把那处 mac 专属 define 改成 mac+ios 都加。
+          python3 - << 'PYEOF'
+          import sys
+          p = "/Users/runner/src/third_party/ffmpeg/BUILD.gn"
+          s = open(p).read()
+          # 原结构（第361行附近）：
+          #   if (is_mac) {
+          #     ...
+          #     defines += [ "_DARWIN_C_SOURCE" ]
+          #   }
+          # 直接把这一行 define 提为无条件加在 ffmpeg_internal 上最稳：
+          # 在 ffmpeg_internal 的 defines 块里追加。defines 初始声明是：
+          #   defines = [\n    "HAVE_AV_CONFIG_H",\n ...
+          anchor = '  defines = [\n    "HAVE_AV_CONFIG_H",'
+          if anchor in s:
+              s = s.replace(
+                  anchor,
+                  '  defines = [\n    "HAVE_AV_CONFIG_H",\n    "_DARWIN_C_SOURCE",  # iOS 同样需要，暴露 u_int 等 BSD 类型',
+                  1
+              )
+              open(p, "w").write(s)
+              print("✅ 已给 ffmpeg_internal 无条件加 _DARWIN_C_SOURCE")
+          else:
+              print("❌ 未找到 defines = [ HAVE_AV_CONFIG_H 锚点，结构变了，中止")
+              sys.exit(1)
+          PYEOF
+          echo "---- 确认 _DARWIN_C_SOURCE 已加 ----"
+          grep -n '_DARWIN_C_SOURCE' "$FF/BUILD.gn"
+
+          echo ""
           echo "########## 修复2b: recording 补 ffmpeg deps ##########"
           # recording 的 deps 当前是空的 deps = [ ]
           python3 - << 'PYEOF'
