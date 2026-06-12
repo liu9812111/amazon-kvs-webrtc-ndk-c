@@ -460,6 +460,45 @@ jobs:
           echo "---- sdk/BUILD.gn 中 recording / backing_track 引用 ----"
           grep -n 'recording\|backing_track' "$SRC/sdk/BUILD.gn" | grep modules
 
+      - name: 给 aac/ffmpeg/openh264 补 license 声明
+        run: |
+          python3 - << 'PYEOF'
+          p = "/Users/runner/src/tools_webrtc/libs/generate_licenses.py"
+          s = open(p).read()
+
+          anchor = "LIB_TO_LICENSES_DICT = {"
+          if anchor not in s:
+              print("❌ 未找到 LIB_TO_LICENSES_DICT，结构变了，中止")
+              raise SystemExit(1)
+
+          entries = (
+              "    'aac': ['third_party/aac/fdk-aac/NOTICE'],\n"
+              "    'ffmpeg': ['third_party/ffmpeg/LICENSE.md'],\n"
+              "    'openh264': ['third_party/openh264/src/LICENSE'],\n"
+          )
+
+          if "'aac':" in s and "'ffmpeg':" in s and "'openh264':" in s:
+              print("三个 license 声明已存在，跳过")
+          else:
+              s = s.replace(anchor, anchor + "\n" + entries, 1)
+              open(p, "w").write(s)
+              print("✅ 已补 aac/ffmpeg/openh264 license 声明")
+
+          # 回读校验
+          v = open(p).read()
+          for k in ("'aac'", "'ffmpeg'", "'openh264'"):
+              if k not in v:
+                  print(f"❌ {k} 未写入，中止"); raise SystemExit(1)
+          print("✅ 三个声明回读确认")
+          PYEOF
+          echo "---- patch 后字典头部 ----"
+          grep -n "'aac'\|'ffmpeg'\|'openh264'" /Users/runner/src/tools_webrtc/libs/generate_licenses.py
+
+          echo "---- 确认三个 license 文件真实存在 ----"
+          for f in third_party/aac/fdk-aac/NOTICE third_party/ffmpeg/LICENSE.md third_party/openh264/src/LICENSE; do
+            test -f "/Users/runner/src/$f" && echo "✅ $f" || { echo "❌ 缺 $f"; exit 1; }
+          done
+
       - name: 升级 clang 工具链（兼容 Xcode 15 SDK）
         run: |
           cd /Users/runner/src
@@ -505,10 +544,26 @@ jobs:
             fi
           done
 
-      - name: 临时排查 license（不编译）
+      - name: 编译 iOS XCFramework
         run: |
-          SRC=/Users/runner/src
-          grep -n -A40 'LICENSES_DICT' "$SRC/tools_webrtc/libs/generate_licenses.py"
-          echo "==== ffmpeg ===="; ls -la "$SRC/third_party/ffmpeg/" | grep -iE 'licen|credit'
-          echo "==== openh264 ===="; find "$SRC/third_party/openh264" -maxdepth 2 -iname 'licen*'
-          echo "==== aac ===="; find "$SRC/third_party/aac" -iname 'licen*' -o -iname 'notice*'
+          export PATH="/opt/homebrew/opt/python@3.11/bin:$HOME/depot_tools:$PATH"
+          export PYTHONPATH="$HOME/depot_tools"
+          cd /Users/runner/src
+          python3.11 tools_webrtc/ios/build_ios_libs.py \
+            --output out/ios-release \
+            --arch arm64 \
+            --build_config release \
+            --extra-gn-args "treat_warnings_as_errors=false is_component_ffmpeg=false"
+
+      - name: 打包成 zip
+        run: |
+          cd /Users/runner/src
+          ls -la out/ios-release
+          zip -ry $GITHUB_WORKSPACE/WebRTC.xcframework.zip out/ios-release/WebRTC.xcframework
+
+      - name: 上传为 Artifact（可下载）
+        uses: actions/upload-artifact@v4
+        with:
+          name: WebRTC-iOS-XCFramework
+          path: WebRTC.xcframework.zip
+          retention-days: 30
