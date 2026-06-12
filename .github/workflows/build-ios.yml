@@ -1,16 +1,17 @@
-name: Diagnose Link Targets (minimal)
+name: Build iOS XCFramework (Link Fixed)
 
-# 只做 cat，不编译。一次性看清：
-#  1. ffmpeg/BUILD.gn 对外 ffmpeg target 怎么定义（决定 source_set 改法是否可行）
-#  2. ffmpeg/BUILD.gn 里 link_target_type 的真实写法（上次 sed 是否匹配）
-#  3. sdk/BUILD.gn 里 avconf_objc / framework_objc 的 deps（ffmpeg 该挂哪）
-#  4. recording / backing_track patch 后的 deps
+# 本 yml 在原"编译成功链接问题"基础上，修复了五个导致链接失败的根因：
+#   1. ffmpeg 缺 iOS config       -> 复用 mac/arm64 config 造一份 Chromium/ios/arm64
+#   2. ffmpeg BUILD.gn 给 iOS 错加 -lrt -> patch is_posix && !is_mac 分支排除 ios
+#   3. recording/backing_track 只 include 没 link ffmpeg -> 补 deps
+#   4. recording target 没被 framework 依赖 -> 在 sdk framework deps 里补上
+#   5. 动态生成的 aac BUILD.gn target 名是 aac，但 audio_coding 期望 aac_3p -> 改名
 
 on:
   workflow_dispatch:
 
 jobs:
-  diag:
+  build-ios:
     runs-on: macos-14
     steps:
       - name: 检出代码
@@ -18,6 +19,11 @@ jobs:
         with:
           ref: add-aac-softcodec-mp4recording
           fetch-depth: 1
+
+      - name: 安装 Python 3.11 和 setuptools
+        run: |
+          brew install python@3.11
+          /opt/homebrew/opt/python@3.11/bin/python3.11 -m pip install setuptools --break-system-packages
 
       - name: 安装 depot_tools
         run: |
@@ -48,58 +54,334 @@ jobs:
           key: gclient-ios-${{ hashFiles('DEPS') }}
           restore-keys: gclient-ios-
 
-      - name: 同步依赖（nohooks，够 cat 即可）
+      - name: 同步依赖并修复后执行 hooks
         run: |
           cd $HOME
           gclient sync --no-history --shallow --nohooks
+          # 修复 mac_toolchain.py 在 Python 3.12+ 环境下 pkg_resources 缺失的问题
+          python3 -c "
+          path = '/Users/runner/src/build/mac_toolchain.py'
+          with open(path) as f:
+              content = f.read()
+          if 'except ImportError' not in content:
+              content = content.replace(
+                  'import pkg_resources',
+                  'try:\n    import pkg_resources\nexcept ImportError:\n    pkg_resources = None'
+              )
+              with open(path, 'w') as f:
+                  f.write(content)
+              print('mac_toolchain.py 修复完成')
+          else:
+              print('mac_toolchain.py 已修复过，跳过')
+          "
+          gclient runhooks
+
+      - name: 保存 gclient 依赖缓存（即使后续步骤失败也保存）
+        if: always() && steps.cache-restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: /Users/runner/src/third_party
+          key: gclient-ios-${{ hashFiles('DEPS') }}
 
       # ============================================================
-      # 1. ffmpeg/BUILD.gn —— 对外 target 定义 + link_target_type
+      # 修复 5：部署 third_party/aac，生成 target 名为 aac_3p 的 BUILD.gn
+      # （audio_coding 期望 ../third_party/aac:aac_3p，不是 aac）
       # ============================================================
-      - name: "[1] ffmpeg BUILD.gn 关键段"
+      - name: 部署 third_party/aac 并生成正确的 BUILD.gn
         run: |
-          FF=/Users/runner/src/third_party/ffmpeg/BUILD.gn
-          echo "==== link_target_type 定义那几行（含上下文）===="
-          grep -n -B2 -A2 'link_target_type' "$FF"
-          echo ""
-          echo "==== ffmpeg_internal target 声明行 ===="
-          grep -n 'target(link_target_type\|static_library("ffmpeg\|source_set("ffmpeg\|shared_library("ffmpeg' "$FF"
-          echo ""
-          echo "==== BUILD.gn 最后 60 行（对外 ffmpeg target 定义）===="
-          tail -60 "$FF"
+          AAC_SRC="$GITHUB_WORKSPACE/third_party/aac"
+          AAC_DST="/Users/runner/src/third_party/aac"
+
+          rm -rf "$AAC_DST"
+          mkdir -p "$AAC_DST"
+
+          if [ ! -d "$AAC_SRC/fdk-aac" ]; then
+            git clone --depth=1 https://github.com/mstorsjo/fdk-aac.git "$AAC_DST/fdk-aac"
+            rm -rf "$AAC_DST/fdk-aac/.git"
+          else
+            cp -R "$AAC_SRC/." "$AAC_DST/"
+          fi
+
+          echo "---- fdk-aac 目录结构（2层）----"
+          find "$AAC_DST/fdk-aac" -maxdepth 2 -type d | sort
+
+          python3 - "$AAC_DST" << 'PYEOF'
+          import os, sys
+
+          aac_dst = sys.argv[1]
+          fdk_root = os.path.join(aac_dst, "fdk-aac")
+
+          excluded_dirs = {"arm", "win32", "x86", "fuzzer", "mips", "aarch64", "tests", "benchmark"}
+          sources = []
+          for dirpath, dirnames, filenames in os.walk(fdk_root):
+              path_parts = set(os.path.relpath(dirpath, aac_dst).split(os.sep))
+              if path_parts & excluded_dirs:
+                  continue
+              for fname in sorted(filenames):
+                  if fname.endswith(".cpp"):
+                      rel = os.path.relpath(os.path.join(dirpath, fname), aac_dst)
+                      sources.append(rel)
+          sources.sort()
+          print(f"收集到 {len(sources)} 个 .cpp 文件")
+
+          include_dirs = ["fdk-aac", "."]
+          for entry in sorted(os.listdir(fdk_root)):
+              inc = os.path.join(fdk_root, entry, "include")
+              if os.path.isdir(inc):
+                  include_dirs.append(f"fdk-aac/{entry}/include")
+
+          sources_str = "\n".join(f'    "{s}",' for s in sources)
+          include_str = "\n".join(f'    "{d}",' for d in include_dirs)
+
+          # 关键修复：audio_coding 同时按两个名字依赖 third_party/aac：
+          #   - webrtc_aac / webrtc_aac_wrapper 经 rtc_aac_dir 解析为 //third_party/aac:aac
+          #   - aac_c 直接依赖 //third_party/aac:aac_3p
+          # 所以实体库命名为 aac，再用 group 暴露 aac_3p 和 rtc_aac，三个名字全覆盖。
+          build_gn = f'''config("aac_includes") {{
+            include_dirs = [
+          {include_str}
+            ]
+          }}
+
+          static_library("aac") {{
+            sources = [
+          {sources_str}
+            ]
+            defines = [ "SUPPRESS_BUILD_DATE_INFO" ]
+            public_configs = [ ":aac_includes" ]
+            configs -= [ "//build/config/compiler:chromium_code" ]
+            configs += [ "//build/config/compiler:no_chromium_code" ]
+            cflags = [ "-w" ]
+            cflags_cc = [ "-w" ]
+          }}
+
+          group("aac_3p") {{
+            public_deps = [ ":aac" ]
+          }}
+
+          group("rtc_aac") {{
+            public_deps = [ ":aac" ]
+          }}
+          '''
+
+          out_path = os.path.join(aac_dst, "BUILD.gn")
+          with open(out_path, "w") as f:
+              f.write(build_gn)
+          print(f"BUILD.gn 已写入: {out_path}")
+          PYEOF
+
+          echo "---- 确认 target 名 ----"
+          grep -n 'static_library\|group' "$AAC_DST/BUILD.gn"
 
       # ============================================================
-      # 2. sdk/BUILD.gn —— avconf_objc 与 framework_objc 的 deps
+      # 修复 1：为 ffmpeg 生成 iOS config（复用 mac/arm64）
+      # os_config=current_os=ios，platform_config_root=
+      #   chromium/config/Chromium/ios/arm64，但该目录不存在
+      # mac/arm64 与 ios/arm64 同为 arm64 + HAVE_CLOCK_GETTIME 0，可直接复用
       # ============================================================
-      - name: "[2] sdk avconf_objc / framework_objc deps"
+      - name: 生成 ffmpeg iOS config（复用 mac/arm64）
         run: |
-          SDK=/Users/runner/src/sdk/BUILD.gn
-          echo "==== avconf_objc target 整块（recording/backing_track 就挂这）===="
-          awk '/[a-z_]*\("avconf_objc"\)/{f=1} f{print NR": "$0} f&&/^[[:space:]]*}$/{c++; if(c>=1){exit}}' "$SDK" | head -80
-          echo ""
-          echo "==== avconf_objc 出现的位置 ===="
-          grep -n 'avconf_objc' "$SDK"
-          echo ""
-          echo "==== framework_objc 里 deps 段（看 ffmpeg/recording/backing_track 怎么进来）===="
-          grep -n 'ffmpeg\|recording\|backing_track\|avconf_objc' "$SDK"
+          FF=/Users/runner/src/third_party/ffmpeg
+          CFG_ROOT="$FF/chromium/config"
+
+          # 找到实际生效的 branding：默认非 chrome-branded 为 Chromium
+          for BRAND in Chromium Chrome; do
+            SRC="$CFG_ROOT/$BRAND/mac/arm64"
+            DST="$CFG_ROOT/$BRAND/ios/arm64"
+            if [ -d "$SRC" ]; then
+              echo "==== 复用 $BRAND/mac/arm64 -> $BRAND/ios/arm64 ===="
+              rm -rf "$DST"
+              mkdir -p "$DST"
+              # 用 tar 管道复制，避开 macOS cp -R 的 xattr / 多级目录报错
+              ( cd "$SRC" && tar cf - . ) | ( cd "$DST" && tar xf - )
+              echo "已生成: $DST"
+              ls -la "$DST"
+            else
+              echo "（$BRAND 无 mac/arm64，跳过）"
+            fi
+          done
+
+          echo "---- 校验 ios/arm64 config.h 存在 ----"
+          test -f "$CFG_ROOT/Chromium/ios/arm64/config.h" \
+            && echo "✅ Chromium/ios/arm64/config.h OK" \
+            || { echo "❌ 缺 config.h"; exit 1; }
+          test -f "$CFG_ROOT/Chromium/ios/arm64/libavutil/avconfig.h" \
+            && echo "✅ avconfig.h OK" \
+            || echo "⚠️ 无 avconfig.h（下一步会单独保证）"
 
       # ============================================================
-      # 3. recording / backing_track 当前 deps（patch 前的原始态）
+      # 修复 2 + 4：patch ffmpeg / recording / backing_track / sdk 的 BUILD.gn
       # ============================================================
-      - name: "[3] recording / backing_track 原始 BUILD.gn"
+      - name: Patch BUILD.gn（去 lrt + 补 ffmpeg deps + 挂 recording）
         run: |
           SRC=/Users/runner/src
-          echo "==== recording/BUILD.gn ===="
-          cat "$SRC/modules/recording/BUILD.gn"
-          echo ""
-          echo "==== backing_track/BUILD.gn（deps 段）===="
-          grep -n -A12 'deps = \[' "$SRC/modules/backing_track/BUILD.gn"
+          FF=$SRC/third_party/ffmpeg
 
-      # ============================================================
-      # 4. avconf_objc 到底是不是 rtc_source_set（决定 .o 能否进 framework）
-      # ============================================================
-      - name: "[4] avconf_objc 的 target 类型"
+          echo "########## 修复2a: ffmpeg 去掉 iOS 的 -lrt ##########"
+          # 两处 is_posix && !is_mac 分支（含 libs += rt 的那处）排除 ios
+          sed -i '' 's/is_posix && !is_mac)/is_posix \&\& !is_mac \&\& !is_ios)/g' "$FF/BUILD.gn"
+          echo "---- patch 后的分支条件 ----"
+          grep -n 'is_posix && !is_mac' "$FF/BUILD.gn" || echo "（已全部改为 && !is_ios）"
+          echo "---- 确认 rt 那段现在被 !is_ios 保护 ----"
+          grep -n -B2 '"rt"' "$FF/BUILD.gn"
+
+          echo ""
+          echo "########## 修复2a-2: ffmpeg_internal 强制 source_set ##########"
+          # 根因（已用 gn desc 确认）：
+          #   //third_party/ffmpeg 是 source_set，deps=[:ffmpeg_internal]
+          #   而 ffmpeg_internal 是 static_library(.a)。
+          #   source_set 依赖 static_library 时，.a 是独立链接单元，.o 不展开；
+          #   WebRTC 的 apple_framework_bundle 又不收第三方 .a，
+          #   所以 ffmpeg 的 .o 从未进 framework -> av* 全 undefined。
+          # 改 ffmpeg_internal 为 source_set 后，.o 随依赖链展开进 framework。
+          python3 - << 'PYEOF'
+          import sys
+          p = "/Users/runner/src/third_party/ffmpeg/BUILD.gn"
+          s = open(p).read()
+          target = 'link_target_type = "static_library"'
+          if target not in s:
+              print("❌ 未找到 link_target_type = static_library，结构变了，中止")
+              sys.exit(1)
+          s = s.replace(
+              target,
+              '# iOS framework 需要 .o 直接展开，改用 source_set\n  link_target_type = "source_set"'
+          )
+          open(p, "w").write(s)
+          # 立即回读验证
+          v = open(p).read()
+          if 'link_target_type = "source_set"' not in v or 'link_target_type = "static_library"' in v:
+              print("❌ patch 写入后回读校验失败，中止")
+              sys.exit(1)
+          print("✅ ffmpeg_internal 已改为 source_set 并回读确认")
+          PYEOF
+          echo "---- 确认 link_target_type（应只剩 source_set）----"
+          grep -n 'link_target_type =' "$FF/BUILD.gn"
+
+          echo ""
+          echo "########## 修复2b: recording 补 ffmpeg deps ##########"
+          # recording 的 deps 当前是空的 deps = [ ]
+          python3 - << 'PYEOF'
+          p = "/Users/runner/src/modules/recording/BUILD.gn"
+          s = open(p).read()
+          if '//third_party/ffmpeg"' not in s.replace('ffmpeg_dependent_config',''):
+              # 把空 deps = [ ] 替换为带 ffmpeg 的
+              s = s.replace("deps = [\n  ]", 'deps = [\n    "//third_party/ffmpeg",\n  ]')
+              # 兜底：单行空 deps
+              s = s.replace("deps = [ ]", 'deps = [ "//third_party/ffmpeg" ]')
+              open(p,"w").write(s)
+              print("recording deps 已补 ffmpeg")
+          else:
+              print("recording 已有 ffmpeg deps，跳过")
+          PYEOF
+          echo "---- recording/BUILD.gn deps ----"
+          grep -n -A4 'deps = \[' "$SRC/modules/recording/BUILD.gn"
+
+          echo ""
+          echo "########## 修复2c: backing_track 补 ffmpeg deps ##########"
+          python3 - << 'PYEOF'
+          p = "/Users/runner/src/modules/backing_track/BUILD.gn"
+          s = open(p).read()
+          # 只看 deps 块里有没有真正的 //third_party/ffmpeg（排除 public_configs 里的）
+          import re
+          m = re.search(r'deps = \[(.*?)\]', s, re.S)
+          if m and '//third_party/ffmpeg"' not in m.group(1):
+              s = s.replace(
+                  '"../audio_mixer:audio_mixer_impl",',
+                  '"../audio_mixer:audio_mixer_impl",\n    "//third_party/ffmpeg",'
+              )
+              open(p,"w").write(s)
+              print("backing_track deps 已补 ffmpeg")
+          else:
+              print("backing_track 已有 ffmpeg deps，跳过")
+          PYEOF
+          echo "---- backing_track/BUILD.gn deps ----"
+          grep -n -A6 'deps = \[' "$SRC/modules/backing_track/BUILD.gn"
+
+          echo ""
+          echo "########## 修复4: sdk framework 挂上 recording ##########"
+          # sdk/BUILD.gn:1814 已有 //modules/backing_track:backing_track
+          # recording 全树没人引用，在 backing_track 那行后补 recording
+          python3 - << 'PYEOF'
+          p = "/Users/runner/src/sdk/BUILD.gn"
+          s = open(p).read()
+          if '//modules/recording:recording' not in s:
+              s = s.replace(
+                  '"//modules/backing_track:backing_track",',
+                  '"//modules/backing_track:backing_track",\n          "//modules/recording:recording",'
+              )
+              open(p,"w").write(s)
+              print("sdk framework 已挂 recording")
+          else:
+              print("sdk 已挂 recording，跳过")
+          PYEOF
+          echo "---- sdk/BUILD.gn 中 recording / backing_track 引用 ----"
+          grep -n 'recording\|backing_track' "$SRC/sdk/BUILD.gn" | grep modules
+
+      - name: 升级 clang 工具链（兼容 Xcode 15 SDK）
         run: |
-          SDK=/Users/runner/src/sdk/BUILD.gn
-          echo "==== avconf_objc 用的是哪种 target 模板 ===="
-          grep -n -B1 '"avconf_objc"' "$SDK"
+          cd /Users/runner/src
+          echo "当前 clang 版本："
+          third_party/llvm-build/Release+Asserts/bin/clang --version || true
+
+          curl -fsSL "https://chromium.googlesource.com/chromium/src/+/refs/branch-heads/5993/tools/clang/scripts/update.py?format=TEXT" \
+            | python3 -c "import base64,sys;sys.stdout.buffer.write(base64.b64decode(sys.stdin.read()))" \
+            > /tmp/clang_update.py
+
+          rm -rf third_party/llvm-build
+          python3.11 /tmp/clang_update.py --output-dir third_party/llvm-build/Release+Asserts
+
+          cp /tmp/clang_update.py tools/clang/scripts/update.py
+          sed -i '' -E 's/clang_version = "16[0-9.]*"/clang_version = "17"/' build/toolchain/toolchain.gni
+          echo "---- toolchain.gni 中的 clang_version ----"
+          grep -n 'clang_version' build/toolchain/toolchain.gni || true
+
+          echo "替换后 clang 版本："
+          third_party/llvm-build/Release+Asserts/bin/clang --version
+
+      - name: 保证 FFmpeg avconfig.h 存在（iOS arm64）
+        run: |
+          # ffmpeg_internal 的 sources 里直接引用 $platform_config_root/libavutil/avconfig.h
+          # 复用 mac/arm64 时该文件应已带过来，这里兜底确保存在
+          FF=/Users/runner/src/third_party/ffmpeg
+          for BRAND in Chromium Chrome; do
+            DSTDIR="$FF/chromium/config/$BRAND/ios/arm64/libavutil"
+            [ -d "$FF/chromium/config/$BRAND/ios/arm64" ] || continue
+            mkdir -p "$DSTDIR"
+            if [ ! -f "$DSTDIR/avconfig.h" ]; then
+              cat > "$DSTDIR/avconfig.h" << 'EOF'
+          /* Generated for iOS arm64 */
+          #ifndef AVUTIL_AVCONFIG_H
+          #define AVUTIL_AVCONFIG_H
+          #define AV_HAVE_BIGENDIAN 0
+          #define AV_HAVE_FAST_UNALIGNED 1
+          #endif /* AVUTIL_AVCONFIG_H */
+          EOF
+              echo "已补 $DSTDIR/avconfig.h"
+            else
+              echo "$DSTDIR/avconfig.h 已存在"
+            fi
+          done
+
+      - name: 编译 iOS XCFramework
+        run: |
+          export PATH="/opt/homebrew/opt/python@3.11/bin:$HOME/depot_tools:$PATH"
+          export PYTHONPATH="$HOME/depot_tools"
+          cd /Users/runner/src
+          python3.11 tools_webrtc/ios/build_ios_libs.py \
+            --output out/ios-release \
+            --arch arm64 \
+            --build_config release \
+            --extra-gn-args "treat_warnings_as_errors=false is_component_ffmpeg=false"
+
+      - name: 打包成 zip
+        run: |
+          cd /Users/runner/src
+          ls -la out/ios-release
+          zip -ry $GITHUB_WORKSPACE/WebRTC.xcframework.zip out/ios-release/WebRTC.xcframework
+
+      - name: 上传为 Artifact（可下载）
+        uses: actions/upload-artifact@v4
+        with:
+          name: WebRTC-iOS-XCFramework
+          path: WebRTC.xcframework.zip
+          retention-days: 30
