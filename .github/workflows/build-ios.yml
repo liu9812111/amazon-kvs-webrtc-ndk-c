@@ -1,10 +1,10 @@
-name: Diagnose Build Environment
+name: Build iOS XCFramework
 
 on:
   workflow_dispatch:
 
 jobs:
-  diagnose:
+  build-ios:
     runs-on: macos-14
     steps:
       - name: 检出代码
@@ -12,6 +12,11 @@ jobs:
         with:
           ref: add-aac-softcodec-mp4recording
           fetch-depth: 1
+
+      - name: 安装 Python 3.11 和 setuptools
+        run: |
+          brew install python@3.11
+          /opt/homebrew/opt/python@3.11/bin/python3.11 -m pip install setuptools --break-system-packages
 
       - name: 安装 depot_tools
         run: |
@@ -42,138 +47,374 @@ jobs:
           key: gclient-ios-${{ hashFiles('DEPS') }}
           restore-keys: gclient-ios-
 
-      - name: 同步依赖（nohooks）
+      - name: 同步依赖并修复后执行 hooks
         run: |
           cd $HOME
           gclient sync --no-history --shallow --nohooks
+          python3 -c "
+          path = '/Users/runner/src/build/mac_toolchain.py'
+          with open(path) as f:
+              content = f.read()
+          if 'except ImportError' not in content:
+              content = content.replace(
+                  'import pkg_resources',
+                  'try:\n    import pkg_resources\nexcept ImportError:\n    pkg_resources = None'
+              )
+              with open(path, 'w') as f:
+                  f.write(content)
+              print('mac_toolchain.py 修复完成')
+          else:
+              print('mac_toolchain.py 已修复过，跳过')
+          "
+          gclient runhooks
 
-      - name: 诊断 AAC
+      - name: 保存 gclient 依赖缓存（即使后续步骤失败也保存）
+        if: always() && steps.cache-restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: /Users/runner/src/third_party
+          key: gclient-ios-${{ hashFiles('DEPS') }}
+
+      - name: 部署 third_party/aac 并生成正确的 BUILD.gn
         run: |
-          AAC_REPO="$GITHUB_WORKSPACE/third_party/aac"
-          AAC_SYNC="/Users/runner/src/third_party/aac"
+          AAC_DST="/Users/runner/src/third_party/aac"
+          rm -rf "$AAC_DST"
+          mkdir -p "$AAC_DST"
 
-          echo "========================================"
-          echo "==== 仓库里 third_party/aac 目录 ===="
-          echo "========================================"
-          ls -la "$AAC_REPO/" 2>/dev/null || echo "❌ 仓库里没有 third_party/aac"
+          git clone --depth=1 https://github.com/mstorsjo/fdk-aac.git "$AAC_DST/fdk-aac"
+          rm -rf "$AAC_DST/fdk-aac/.git"
 
-          echo ""
-          echo "========================================"
-          echo "==== 仓库里 aac 是否有 fdk-aac ===="
-          echo "========================================"
-          ls -la "$AAC_REPO/fdk-aac/" 2>/dev/null || echo "❌ 没有 fdk-aac 子目录"
+          python3 - "$AAC_DST" << 'PYEOF'
+          import os, sys
 
-          echo ""
-          echo "========================================"
-          echo "==== 仓库里 aac/BUILD.gn ===="
-          echo "========================================"
-          cat "$AAC_REPO/BUILD.gn" 2>/dev/null || echo "❌ 没有 BUILD.gn"
+          aac_dst = sys.argv[1]
+          fdk_root = os.path.join(aac_dst, "fdk-aac")
 
-          echo ""
-          echo "========================================"
-          echo "==== gclient sync 后 third_party/aac ===="
-          echo "========================================"
-          ls -la "$AAC_SYNC/" 2>/dev/null || echo "❌ sync 后没有 third_party/aac"
+          excluded_dirs = {"arm", "win32", "x86", "fuzzer", "mips", "aarch64", "tests", "benchmark"}
+          sources = []
+          for dirpath, dirnames, filenames in os.walk(fdk_root):
+              path_parts = set(os.path.relpath(dirpath, aac_dst).split(os.sep))
+              if path_parts & excluded_dirs:
+                  continue
+              for fname in sorted(filenames):
+                  if fname.endswith(".cpp"):
+                      rel = os.path.relpath(os.path.join(dirpath, fname), aac_dst)
+                      sources.append(rel)
 
-          echo ""
-          echo "========================================"
-          echo "==== fdk-aac 所有含 .cpp 的子目录 ===="
-          echo "========================================"
-          find "$AAC_SYNC/fdk-aac" -name "*.cpp" 2>/dev/null \
-            | sed 's|/[^/]*\.cpp$||' | sort -u \
-            | while read d; do
-                count=$(find "$d" -maxdepth 1 -name "*.cpp" | wc -l | tr -d ' ')
-                echo "  $d  ($count .cpp)"
-              done || echo "❌ 没有找到 fdk-aac"
+          sources.sort()
+          print(f"收集到 {len(sources)} 个 .cpp 文件")
 
-          echo ""
-          echo "========================================"
-          echo "==== modules/audio_coding AAC 相关 BUILD.gn ===="
-          echo "========================================"
-          grep -r "aac\|AAC" /Users/runner/src/modules/audio_coding/ \
-            --include="BUILD.gn" -l 2>/dev/null || echo "没有找到"
-          cat /Users/runner/src/modules/audio_coding/BUILD.gn 2>/dev/null \
-            | grep -A5 -B5 "aac" || echo "没有找到 aac 相关内容"
+          include_dirs = ["fdk-aac", "."]
+          for entry in sorted(os.listdir(fdk_root)):
+              inc = os.path.join(fdk_root, entry, "include")
+              if os.path.isdir(inc):
+                  include_dirs.append(f"fdk-aac/{entry}/include")
 
-      - name: 诊断 FFmpeg
+          sources_str = "\n".join(f'    "{s}",' for s in sources)
+          include_str = "\n".join(f'    "{d}",' for d in include_dirs)
+
+          build_gn = f'''config("aac_includes") {{
+            include_dirs = [
+          {include_str}
+            ]
+          }}
+
+          static_library("aac") {{
+            sources = [
+          {sources_str}
+            ]
+            defines = [ "SUPPRESS_BUILD_DATE_INFO" ]
+            public_configs = [ ":aac_includes" ]
+            configs -= [ "//build/config/compiler:chromium_code" ]
+            configs += [ "//build/config/compiler:no_chromium_code" ]
+            cflags = [ "-w" ]
+            cflags_cc = [ "-w" ]
+          }}
+
+          group("rtc_aac") {{
+            public_deps = [ ":aac" ]
+          }}
+          '''
+
+          out_path = os.path.join(aac_dst, "BUILD.gn")
+          with open(out_path, "w") as f:
+              f.write(build_gn)
+          print(f"BUILD.gn 已写入: {out_path}")
+          PYEOF
+
+      - name: 升级 clang 工具链（兼容 Xcode 15 SDK）
         run: |
-          FFMPEG="/Users/runner/src/third_party/ffmpeg"
+          cd /Users/runner/src
+          curl -fsSL "https://chromium.googlesource.com/chromium/src/+/refs/branch-heads/5993/tools/clang/scripts/update.py?format=TEXT" \
+            | python3 -c "import base64,sys;sys.stdout.buffer.write(base64.b64decode(sys.stdin.read()))" \
+            > /tmp/clang_update.py
+          rm -rf third_party/llvm-build
+          python3.11 /tmp/clang_update.py --output-dir third_party/llvm-build/Release+Asserts
+          cp /tmp/clang_update.py tools/clang/scripts/update.py
+          sed -i '' -E 's/clang_version = "16[0-9.]*"/clang_version = "17"/' build/toolchain/toolchain.gni
+          echo "替换后 clang 版本："
+          third_party/llvm-build/Release+Asserts/bin/clang --version
 
-          echo "========================================"
-          echo "==== ffmpeg 根目录文件列表 ===="
-          echo "========================================"
-          ls -la "$FFMPEG/"
-
-          echo ""
-          echo "========================================"
-          echo "==== ffmpeg BUILD.gn 完整内容 ===="
-          echo "========================================"
-          cat "$FFMPEG/BUILD.gn" || echo "❌ 没有 BUILD.gn"
-
-          echo ""
-          echo "========================================"
-          echo "==== ffmpeg 所有 .gn/.gni 文件 ===="
-          echo "========================================"
-          find "$FFMPEG" -name "*.gn" -o -name "*.gni" | sort
-
-          echo ""
-          echo "========================================"
-          echo "==== ffmpeg 子目录结构（3层）===="
-          echo "========================================"
-          find "$FFMPEG" -maxdepth 3 -type d | sort
-
-          echo ""
-          echo "========================================"
-          echo "==== ffmpeg 所有预编译库 .a ===="
-          echo "========================================"
-          find "$FFMPEG" -name "*.a" | sort || echo "没有 .a 文件"
-
-          echo ""
-          echo "========================================"
-          echo "==== ffmpeg chromium/config 目录 ===="
-          echo "========================================"
-          ls -la "$FFMPEG/chromium/config/" 2>/dev/null || echo "没有 chromium/config 目录"
-          find "$FFMPEG/chromium" -maxdepth 4 -type d 2>/dev/null | sort || echo "没有 chromium 目录"
-
-      - name: 诊断 recorder 和 backing_track
+      - name: 为 FFmpeg 生成 iOS arm64 配置
         run: |
-          echo "========================================"
-          echo "==== modules/recording BUILD.gn ===="
-          echo "========================================"
-          cat "/Users/runner/src/modules/recording/BUILD.gn" || echo "❌ 没有找到"
+          FFMPEG_SRC="/Users/runner/src/third_party/ffmpeg"
+          IOS_CONFIG_DIR="$FFMPEG_SRC/chromium/config/Chrome/ios/arm64"
+          mkdir -p "$IOS_CONFIG_DIR/libavutil"
 
-          echo ""
-          echo "========================================"
-          echo "==== modules/backing_track BUILD.gn ===="
-          echo "========================================"
-          cat "/Users/runner/src/modules/backing_track/BUILD.gn" || echo "❌ 没有找到"
+          export XCODE_PATH=$(xcode-select -p)
+          export IOS_SDK="$XCODE_PATH/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS.sdk"
 
-          echo ""
-          echo "========================================"
-          echo "==== 搜索所有引用 ffmpeg 的 BUILD.gn ===="
-          echo "========================================"
-          grep -r "ffmpeg" /Users/runner/src/modules/ --include="BUILD.gn" -l \
-            2>/dev/null || echo "没有找到"
+          cd "$FFMPEG_SRC"
 
-          echo ""
-          echo "========================================"
-          echo "==== 搜索 lrt/librt 在哪里被引入 ===="
-          echo "========================================"
-          grep -r "lrt\|librt" /Users/runner/src/third_party/ffmpeg/ \
-            --include="*.gn" --include="*.gni" 2>/dev/null || echo "ffmpeg 里没有找到"
-          grep -r "lrt\|librt" /Users/runner/src/modules/ \
-            --include="*.gn" 2>/dev/null || echo "modules 里没有找到"
+          # 运行 configure 生成 iOS arm64 的配置头文件
+          ./configure \
+            --target-os=darwin \
+            --arch=aarch64 \
+            --cc="clang -arch arm64 -isysroot $IOS_SDK -mios-version-min=12.0" \
+            --enable-cross-compile \
+            --sysroot="$IOS_SDK" \
+            --enable-static \
+            --disable-shared \
+            --disable-programs \
+            --disable-doc \
+            --disable-debug \
+            --enable-pic \
+            --disable-avdevice \
+            --disable-postproc \
+            --disable-network \
+            --disable-everything \
+            --enable-avformat \
+            --enable-avcodec \
+            --enable-avutil \
+            --enable-swresample \
+            --enable-decoder=aac \
+            --enable-decoder=h264 \
+            --enable-encoder=aac \
+            --enable-muxer=mp4 \
+            --enable-muxer=mov \
+            --enable-demuxer=mov \
+            --enable-demuxer=mp4 \
+            --enable-protocol=file \
+            --enable-bsf=aac_adtstoasc \
+            --prefix="$IOS_CONFIG_DIR" \
+            || { echo "configure 失败，查看日志："; tail -50 ffbuild/config.log; exit 1; }
 
-      - name: 诊断仓库 third_party 全貌
+          # 把生成的配置头文件复制到 chromium 期望的路径
+          cp config.h "$IOS_CONFIG_DIR/config.h"
+          cp config_components.h "$IOS_CONFIG_DIR/config_components.h" 2>/dev/null || true
+          cp libavutil/avconfig.h "$IOS_CONFIG_DIR/libavutil/avconfig.h"
+          cp libavutil/ffversion.h "$IOS_CONFIG_DIR/libavutil/ffversion.h" 2>/dev/null || true
+
+          # 同时复制到源码目录供其他头文件引用
+          cp libavutil/avconfig.h "$FFMPEG_SRC/libavutil/avconfig.h"
+          cp libavutil/ffversion.h "$FFMPEG_SRC/libavutil/ffversion.h" 2>/dev/null || true
+
+          echo "---- 生成的配置文件 ----"
+          ls -la "$IOS_CONFIG_DIR/"
+          ls -la "$IOS_CONFIG_DIR/libavutil/"
+
+      - name: 为 FFmpeg 生成 iOS 的 ffmpeg_generated.gni
         run: |
-          echo "========================================"
-          echo "==== 仓库里 third_party 所有目录 ===="
-          echo "========================================"
-          ls -la "$GITHUB_WORKSPACE/third_party/" || echo "❌ 没有 third_party 目录"
+          FFMPEG_SRC="/Users/runner/src/third_party/ffmpeg"
+          IOS_CONFIG_DIR="$FFMPEG_SRC/chromium/config/Chrome/ios/arm64"
 
-          echo ""
-          echo "========================================"
-          echo "==== 仓库里所有引用 ffmpeg 的 .gn 文件 ===="
-          echo "========================================"
-          find "$GITHUB_WORKSPACE" -name "*.gn" \
-            | xargs grep -l "ffmpeg" 2>/dev/null || echo "没有找到"
+          # 修改 ffmpeg_options.gni，让它识别 iOS 平台
+          python3 - "$FFMPEG_SRC" "$IOS_CONFIG_DIR" << 'PYEOF'
+          import os, sys, re, subprocess
+
+          ffmpeg_src = sys.argv[1]
+          ios_config_dir = sys.argv[2]
+
+          # 读取 config.h，提取所有 HAVE_xxx=1 和 CONFIG_xxx=1
+          config_h = os.path.join(ios_config_dir, "config.h")
+          enabled = set()
+          with open(config_h) as f:
+              for line in f:
+                  m = re.match(r'#define\s+(\w+)\s+1', line)
+                  if m:
+                      enabled.add(m.group(1))
+
+          print(f"从 config.h 读取到 {len(enabled)} 个启用项")
+
+          # 扫描所有 .c 源文件，根据 config.h 决定哪些要编译
+          # chromium 的做法是用 generate_gn.py 脚本，但我们直接
+          # 收集 ffmpeg_generated.gni 里已有的 iOS 兼容源文件
+          # 最简单的办法：把 mac/arm64 的配置复制过来作为 iOS/arm64 基础
+          mac_config = os.path.join(ffmpeg_src, "chromium/config/Chrome/mac/arm64")
+          if os.path.exists(mac_config):
+              import shutil
+              os.makedirs(ios_config_dir, exist_ok=True)
+              for fname in os.listdir(mac_config):
+                  src = os.path.join(mac_config, fname)
+                  dst = os.path.join(ios_config_dir, fname)
+                  if os.path.isfile(src) and not os.path.exists(dst):
+                      shutil.copy2(src, dst)
+                      print(f"从 mac/arm64 复制: {fname}")
+              # 复制 libavutil 子目录
+              mac_avutil = os.path.join(mac_config, "libavutil")
+              ios_avutil = os.path.join(ios_config_dir, "libavutil")
+              if os.path.exists(mac_avutil):
+                  os.makedirs(ios_avutil, exist_ok=True)
+                  for fname in os.listdir(mac_avutil):
+                      src = os.path.join(mac_avutil, fname)
+                      dst = os.path.join(ios_avutil, fname)
+                      if os.path.isfile(src) and not os.path.exists(dst):
+                          shutil.copy2(src, dst)
+                          print(f"从 mac/arm64/libavutil 复制: {fname}")
+              print("mac/arm64 配置复制完成")
+          else:
+              print("❌ 没有找到 mac/arm64 配置，无法复制")
+              sys.exit(1)
+          PYEOF
+
+          echo "---- iOS config 目录最终内容 ----"
+          ls -la "$IOS_CONFIG_DIR/"
+          ls -la "$IOS_CONFIG_DIR/libavutil/" 2>/dev/null || true
+
+      - name: 修复 ffmpeg_options.gni 和 ffmpeg_generated.gni 支持 iOS
+        run: |
+          FFMPEG_SRC="/Users/runner/src/third_party/ffmpeg"
+
+          # ffmpeg_options.gni 里 os_config 对 iOS 没有分支，需要让它走 mac 路径
+          python3 - "$FFMPEG_SRC" << 'PYEOF'
+          import re, os
+
+          ffmpeg_src = sys.argv[1] if len(sys.argv) > 1 else "/Users/runner/src/third_party/ffmpeg"
+
+          options_path = os.path.join(ffmpeg_src, "ffmpeg_options.gni")
+          with open(options_path) as f:
+              content = f.read()
+
+          print("---- ffmpeg_options.gni 原始 os_config 相关内容 ----")
+          for i, line in enumerate(content.splitlines()):
+              if 'os_config' in line or 'is_ios' in line or 'is_mac' in line:
+                  print(f"  {i+1}: {line}")
+
+          # 如果已经有 ios 处理就跳过
+          if 'is_ios' in content and 'ios' in content:
+              print("ffmpeg_options.gni 已有 iOS 支持，跳过")
+          else:
+              # 在 is_mac 的 os_config 赋值后面加上 iOS 的处理
+              # 找到类似 } else if (is_mac) { os_config = "mac" } 的模式
+              # 让 iOS 也走 mac 的 os_config
+              new_content = re.sub(
+                  r'(if\s*\(is_mac\)\s*\{[^}]*os_config\s*=\s*"mac"[^}]*\})',
+                  r'\1 else if (is_ios) { os_config = "mac" }',
+                  content
+              )
+              if new_content != content:
+                  with open(options_path, 'w') as f:
+                      f.write(new_content)
+                  print("ffmpeg_options.gni 已修改，iOS 走 mac os_config")
+              else:
+                  print("⚠️  正则未匹配，尝试直接追加")
+                  # 打印更多内容帮助调试
+                  print(content[:3000])
+          PYEOF
+
+          echo "---- ffmpeg_options.gni 完整内容 ----"
+          cat "$FFMPEG_SRC/ffmpeg_options.gni"
+
+      - name: 修复 video_capture BUILD.gn 移除 iOS 上的 -lrt
+        run: |
+          python3 - << 'PYEOF'
+          import re
+
+          path = "/Users/runner/src/modules/video_capture/BUILD.gn"
+          with open(path) as f:
+              content = f.read()
+
+          # -lrt 只在 Linux 上有效，iOS/mac 上没有，需要加平台判断包裹
+          # 找到裸露的 "-lrt" 并用 is_linux 条件包裹
+          new_content = re.sub(
+              r'(\s+libs\s*\+?=\s*\[[^\]]*?)("-lrt")([^\]]*?\])',
+              lambda m: m.group(0).replace('"-lrt"', '') + '\n  if (is_linux) { libs += ["-lrt"] }',
+              content
+          )
+
+          if new_content != content:
+              with open(path, 'w') as f:
+                  f.write(new_content)
+              print("video_capture BUILD.gn 已修复 -lrt")
+          else:
+              # 尝试另一种格式
+              new_content2 = content.replace('"-lrt"', '# removed -lrt (linux only)')
+              if new_content2 != content:
+                  with open(path, 'w') as f:
+                      f.write(new_content2)
+                  print("video_capture BUILD.gn 已注释掉 -lrt")
+              else:
+                  print("没有找到 -lrt，跳过")
+          PYEOF
+
+      - name: 修复 recording 和 backing_track BUILD.gn 补充 ffmpeg 依赖
+        run: |
+          # recording 和 backing_track 的 BUILD.gn 只有 public_configs
+          # 没有把 //third_party/ffmpeg:ffmpeg 加入 deps，导致链接时找不到符号
+          python3 - << 'PYEOF'
+          import os
+
+          files = [
+              "/Users/runner/src/modules/recording/BUILD.gn",
+              "/Users/runner/src/modules/backing_track/BUILD.gn",
+          ]
+
+          for path in files:
+              with open(path) as f:
+                  content = f.read()
+
+              if '//third_party/ffmpeg:ffmpeg' in content:
+                  print(f"{path}: 已有 ffmpeg dep，跳过")
+                  continue
+
+              # 在 deps = [ 后面加入 ffmpeg 依赖
+              if 'deps = [' in content:
+                  new_content = content.replace(
+                      'deps = [',
+                      'deps = [\n    "//third_party/ffmpeg:ffmpeg",',
+                      1
+                  )
+              else:
+                  # 没有 deps，在 public_configs 前面加
+                  new_content = content.replace(
+                      'public_configs = [',
+                      'deps = [\n    "//third_party/ffmpeg:ffmpeg",\n  ]\n  public_configs = [',
+                      1
+                  )
+
+              with open(path, 'w') as f:
+                  f.write(new_content)
+              print(f"{path}: 已添加 ffmpeg dep")
+          PYEOF
+
+      - name: 编译 iOS XCFramework
+        run: |
+          export PATH="/opt/homebrew/opt/python@3.11/bin:$HOME/depot_tools:$PATH"
+          export PYTHONPATH="$HOME/depot_tools"
+          cd /Users/runner/src
+          python3.11 tools_webrtc/ios/build_ios_libs.py \
+            --output out/ios-release \
+            --arch arm64 \
+            --build_config release \
+            --extra-gn-args "treat_warnings_as_errors=false ffmpeg_branding=\"Chrome\" ffmpeg_arch=\"arm64\" os_config=\"ios\"" \
+            -- -k 1 2>&1 | tee /tmp/build_log.txt || true
+
+          echo "==== 所有 FAILED 行 ===="
+          grep "FAILED:" /tmp/build_log.txt || echo "没有 FAILED"
+          echo "==== 所有 error: 行（前30条）===="
+          grep " error:" /tmp/build_log.txt | head -30 || echo "没有 error"
+
+          grep -q "FAILED:" /tmp/build_log.txt && exit 1 || exit 0
+
+      - name: 打包成 zip
+        run: |
+          cd /Users/runner/src
+          ls -la out/ios-release
+          zip -ry $GITHUB_WORKSPACE/WebRTC.xcframework.zip out/ios-release/WebRTC.xcframework
+
+      - name: 上传为 Artifact（可下载）
+        uses: actions/upload-artifact@v4
+        with:
+          name: WebRTC-iOS-XCFramework
+          path: WebRTC.xcframework.zip
+          retention-days: 30
