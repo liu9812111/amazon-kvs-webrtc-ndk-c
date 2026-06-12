@@ -102,8 +102,8 @@ jobs:
           aac_dst = sys.argv[1]
           fdk_root = os.path.join(aac_dst, "fdk-aac")
 
-          # 收集所有 .cpp，排除平台特定优化文件
-          excluded_dirs = {"arm", "win32", "x86"}
+          # 收集所有 .cpp，排除平台特定优化文件和 fuzzer
+          excluded_dirs = {"arm", "win32", "x86", "fuzzer"}
           sources = []
           for dirpath, dirnames, filenames in os.walk(fdk_root):
               # 检查路径中是否含有要排除的目录名
