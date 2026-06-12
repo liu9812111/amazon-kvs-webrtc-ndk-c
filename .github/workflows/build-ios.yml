@@ -92,70 +92,81 @@ jobs:
             cp -R "$AAC_SRC/." "$AAC_DST/"
           fi
 
-          echo "---- 验证关键头文件是否存在 ----"
-          ls "$AAC_DST/fdk-aac/libFDK/include/machine_type.h" && echo "✅ 存在" || echo "❌ 不存在"
-          ls "$AAC_DST/fdk-aac/libAACenc/include/aacenc_lib.h" && echo "✅ 存在" || echo "❌ 不存在"
+          echo "---- fdk-aac 目录结构（2层）----"
+          find "$AAC_DST/fdk-aac" -maxdepth 2 -type d | sort
+
+          # 用 Python 收集 sources 并生成 BUILD.gn，彻底避免 shell heredoc 的多行替换问题
+          python3 - "$AAC_DST" << 'PYEOF'
+          import os, sys
+
+          aac_dst = sys.argv[1]
+          fdk_root = os.path.join(aac_dst, "fdk-aac")
 
           # 收集所有 .cpp，排除平台特定优化文件
-          SOURCES=""
-          while IFS= read -r f; do
-            rel="${f#$AAC_DST/}"
-            SOURCES="${SOURCES}    \"${rel}\",\n"
-          done < <(find "$AAC_DST/fdk-aac" -name "*.cpp" \
-                    ! -path "*/arm/*" \
-                    ! -path "*/win32/*" \
-                    ! -path "*/x86/*" \
-                    | sort)
+          excluded_dirs = {"arm", "win32", "x86"}
+          sources = []
+          for dirpath, dirnames, filenames in os.walk(fdk_root):
+              # 检查路径中是否含有要排除的目录名
+              parts = set(dirpath.replace(aac_dst + "/", "").split(os.sep))
+              if parts & excluded_dirs:
+                  continue
+              for fname in sorted(filenames):
+                  if fname.endswith(".cpp"):
+                      rel = os.path.relpath(os.path.join(dirpath, fname), aac_dst)
+                      sources.append(rel)
 
-          # 注意：用单引号 'GNGEOF' 防止 shell 展开 $SOURCES 以外的内容
-          # $SOURCES 通过 printf 单独插入
-          cat > "$AAC_DST/BUILD.gn" << 'GNGEOF'
-             config("aac_includes") {
-               include_dirs = [
-                 "fdk-aac",
-                 "fdk-aac/libAACdec/include",
-                 "fdk-aac/libAACenc/include",
-                 "fdk-aac/libArithCoding/include",
-                 "fdk-aac/libDRCdec/include",
-                 "fdk-aac/libFDK/include",
-                 "fdk-aac/libMpegTPDec/include",
-                 "fdk-aac/libMpegTPEnc/include",
-                 "fdk-aac/libPCMutils/include",
-                 "fdk-aac/libSACdec/include",
-                 "fdk-aac/libSACenc/include",
-                 "fdk-aac/libSBRdec/include",
-                 "fdk-aac/libSBRenc/include",
-                 ".",
-               ]
-             }
-             
-          static_library("aac") {
-               sources = [
-             SOURCES_PLACEHOLDER
-               ]
-               defines = [ "SUPPRESS_BUILD_DATE_INFO" ]
-               public_configs = [ ":aac_includes" ]
-               configs -= [ "//build/config/compiler:chromium_code" ]
-               configs += [ "//build/config/compiler:no_chromium_code" ]
-               cflags = [ "-w" ]
-               cflags_cc = [ "-w" ]
-             }
-             
-             group("rtc_aac") {
-               public_deps = [ ":aac" ]
-             }
-             GNGEOF
+          sources.sort()
+          print(f"收集到 {len(sources)} 个 .cpp 文件")
 
-          # 把占位符替换成真实的 sources 列表
-          printf "$SOURCES" > /tmp/aac_sources.txt
-          sed -i '' "s|SOURCES_PLACEHOLDER|$(cat /tmp/aac_sources.txt)|" "$AAC_DST/BUILD.gn"
+          # 动态检测所有 include 目录（libXXX/include 格式）
+          include_dirs = ["fdk-aac", "."]
+          for entry in sorted(os.listdir(fdk_root)):
+              inc = os.path.join(fdk_root, entry, "include")
+              if os.path.isdir(inc):
+                  include_dirs.append(f"fdk-aac/{entry}/include")
+
+          print("include_dirs:")
+          for d in include_dirs:
+              print(f"  {d}")
+
+          sources_str = "\n".join(f'    "{s}",' for s in sources)
+          include_str = "\n".join(f'    "{d}",' for d in include_dirs)
+
+          build_gn = f'''config("aac_includes") {{
+            include_dirs = [
+          {include_str}
+            ]
+          }}
+
+          static_library("aac") {{
+            sources = [
+          {sources_str}
+            ]
+            defines = [ "SUPPRESS_BUILD_DATE_INFO" ]
+            public_configs = [ ":aac_includes" ]
+            configs -= [ "//build/config/compiler:chromium_code" ]
+            configs += [ "//build/config/compiler:no_chromium_code" ]
+            cflags = [ "-w" ]
+            cflags_cc = [ "-w" ]
+          }}
+
+          group("rtc_aac") {{
+            public_deps = [ ":aac" ]
+          }}
+          '''
+
+          out_path = os.path.join(aac_dst, "BUILD.gn")
+          with open(out_path, "w") as f:
+              f.write(build_gn)
+          print(f"BUILD.gn 已写入: {out_path}")
+          PYEOF
 
           echo "---- $AAC_DST 内容 ----"
           ls -la "$AAC_DST"
           echo "---- sources 数量 ----"
           grep -c '\.cpp' "$AAC_DST/BUILD.gn" || true
-          echo "---- BUILD.gn 前 50 行 ----"
-          head -50 "$AAC_DST/BUILD.gn"
+          echo "---- BUILD.gn 完整内容 ----"
+          cat "$AAC_DST/BUILD.gn"
 
       - name: 升级 clang 工具链（兼容 Xcode 15 SDK）
         run: |
