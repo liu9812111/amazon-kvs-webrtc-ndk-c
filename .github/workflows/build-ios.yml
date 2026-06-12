@@ -133,15 +133,17 @@ jobs:
           sources_str = "\n".join(f'    "{s}",' for s in sources)
           include_str = "\n".join(f'    "{d}",' for d in include_dirs)
 
-          # 关键修复：target 名用 aac_3p（audio_coding 的 ../third_party/aac:aac_3p 依赖它）
-          # 同时保留 group("rtc_aac") 兼容 rtc_build_aac 路径
+          # 关键修复：audio_coding 同时按两个名字依赖 third_party/aac：
+          #   - webrtc_aac / webrtc_aac_wrapper 经 rtc_aac_dir 解析为 //third_party/aac:aac
+          #   - aac_c 直接依赖 //third_party/aac:aac_3p
+          # 所以实体库命名为 aac，再用 group 暴露 aac_3p 和 rtc_aac，三个名字全覆盖。
           build_gn = f'''config("aac_includes") {{
             include_dirs = [
           {include_str}
             ]
           }}
 
-          static_library("aac_3p") {{
+          static_library("aac") {{
             sources = [
           {sources_str}
             ]
@@ -153,8 +155,12 @@ jobs:
             cflags_cc = [ "-w" ]
           }}
 
+          group("aac_3p") {{
+            public_deps = [ ":aac" ]
+          }}
+
           group("rtc_aac") {{
-            public_deps = [ ":aac_3p" ]
+            public_deps = [ ":aac" ]
           }}
           '''
 
