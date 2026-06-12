@@ -505,26 +505,10 @@ jobs:
             fi
           done
 
-      - name: 编译 iOS XCFramework
+      - name: 临时排查 license（不编译）
         run: |
-          export PATH="/opt/homebrew/opt/python@3.11/bin:$HOME/depot_tools:$PATH"
-          export PYTHONPATH="$HOME/depot_tools"
-          cd /Users/runner/src
-          python3.11 tools_webrtc/ios/build_ios_libs.py \
-            --output out/ios-release \
-            --arch arm64 \
-            --build_config release \
-            --extra-gn-args "treat_warnings_as_errors=false is_component_ffmpeg=false"
-
-      - name: 打包成 zip
-        run: |
-          cd /Users/runner/src
-          ls -la out/ios-release
-          zip -ry $GITHUB_WORKSPACE/WebRTC.xcframework.zip out/ios-release/WebRTC.xcframework
-
-      - name: 上传为 Artifact（可下载）
-        uses: actions/upload-artifact@v4
-        with:
-          name: WebRTC-iOS-XCFramework
-          path: WebRTC.xcframework.zip
-          retention-days: 30
+          SRC=/Users/runner/src
+          grep -n -A40 'LICENSES_DICT' "$SRC/tools_webrtc/libs/generate_licenses.py"
+          echo "==== ffmpeg ===="; ls -la "$SRC/third_party/ffmpeg/" | grep -iE 'licen|credit'
+          echo "==== openh264 ===="; find "$SRC/third_party/openh264" -maxdepth 2 -iname 'licen*'
+          echo "==== aac ===="; find "$SRC/third_party/aac" -iname 'licen*' -o -iname 'notice*'
