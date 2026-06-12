@@ -250,10 +250,7 @@ jobs:
               "libswresample/swresample_frame.c",
               "libswresample/version.c",
           ]
-          arm_srcs = [
-              "libswresample/aarch64/audio_convert_init.c",
-              "libswresample/aarch64/resample_init.c",
-          ]
+          arm_srcs = []
 
           def make_wrapper(rel):
               # rel 形如 libswresample/options.c -> autorename_libswresample_options.c
@@ -277,8 +274,6 @@ jobs:
           lines.append("]")
           lines.append('if ((is_mac || is_ios) && current_cpu == "arm64") {')
           lines.append("  ffmpeg_c_sources += [")
-          for w in arm_wrappers:
-              lines.append('    "%s",' % w)
           lines.append("  ]")
           lines.append("}")
           lines.append("")
