@@ -130,7 +130,13 @@ jobs:
           for BRAND in Chromium Chrome; do
             SRC="$FF/chromium/config/$BRAND/mac/arm64"
             DST="$FF/chromium/config/$BRAND/ios/arm64"
-            [ -d "$SRC" ] && { rm -rf "$DST"; cp -R "$SRC" "$DST"; }
+            if [ -d "$SRC" ]; then
+              rm -rf "$DST"
+              mkdir -p "$DST"
+              # 用 tar 管道复制，避开 macOS cp -R 的 xattr 报错
+              ( cd "$SRC" && tar cf - . ) | ( cd "$DST" && tar xf - )
+              echo "已生成 $DST"
+            fi
           done
 
       - name: Patch BUILD.gn（lrt + deps + recording）
