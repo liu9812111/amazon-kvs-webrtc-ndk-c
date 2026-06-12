@@ -77,63 +77,75 @@ jobs:
           path: /Users/runner/src/third_party
           key: gclient-ios-${{ hashFiles('DEPS') }}
 
-      - name: 部署 third_party/aac（fdk-aac + BUILD.gn）
+      - name: 部署 third_party/aac 并生成正确的 BUILD.gn
         run: |
           AAC_SRC="$GITHUB_WORKSPACE/third_party/aac"
           AAC_DST="/Users/runner/src/third_party/aac"
 
-          # 关键：先删再建，避免缓存命中时 cp -r 把目录嵌套复制成 aac/aac/
           rm -rf "$AAC_DST"
           mkdir -p "$AAC_DST"
 
-          if [ -d "$AAC_SRC" ] && [ -f "$AAC_SRC/BUILD.gn" ]; then
-            echo "从仓库复制 aac 目录（含 BUILD.gn）"
-            cp -R "$AAC_SRC/." "$AAC_DST/"
-          else
-            echo "仓库里没有 third_party/aac，自动拉取 fdk-aac 源码并生成 BUILD.gn"
+          if [ ! -d "$AAC_SRC/fdk-aac" ]; then
             git clone --depth=1 https://github.com/mstorsjo/fdk-aac.git "$AAC_DST/fdk-aac"
             rm -rf "$AAC_DST/fdk-aac/.git"
-
-            cd "$AAC_DST"
-            {
-              echo 'config("aac_includes") {'
-              echo '  include_dirs = ['
-              for d in fdk-aac/lib*/include; do
-                echo "    \"$d\","
-              done
-              echo '    "fdk-aac",'
-              echo '    ".",'
-              echo '  ]'
-              echo '}'
-              echo ''
-              echo '# 注意：target 名必须是 "aac"，'
-              echo '# 对应 //modules/audio_coding:webrtc_aac 依赖的 //third_party/aac:aac'
-              echo 'static_library("aac") {'
-              echo '  sources = ['
-              find fdk-aac -path '*/src/*.cpp' | sort | sed 's|^|    "|; s|$|",|'
-              echo '  ]'
-              echo '  # chromium 构建会把 __DATE__/__TIME__ 定义为空，'
-              echo '  # 用 fdk-aac 自带的开关跳过 build date 信息，避免编译错误'
-              echo '  defines = [ "SUPPRESS_BUILD_DATE_INFO" ]'
-              echo '  public_configs = [ ":aac_includes" ]'
-              echo '  configs -= [ "//build/config/compiler:chromium_code" ]'
-              echo '  configs += [ "//build/config/compiler:no_chromium_code" ]'
-              echo '  # fdk-aac 是第三方代码，关闭所有告警避免被 -Werror 打断'
-              echo '  cflags = [ "-w" ]'
-              echo '  cflags_cc = [ "-w" ]'
-              echo '}'
-              echo ''
-              echo '# 兼容别名，防止其他地方引用 rtc_aac'
-              echo 'group("rtc_aac") {'
-              echo '  public_deps = [ ":aac" ]'
-              echo '}'
-            } > BUILD.gn
+          else
+            cp -R "$AAC_SRC/." "$AAC_DST/"
           fi
 
-          echo "---- $AAC_DST 内容 ----"
-          ls -la "$AAC_DST"
-          echo "---- BUILD.gn 前 40 行 ----"
-          head -40 "$AAC_DST/BUILD.gn" || true
+          # 收集所有 .cpp，但排除 arm/ win32/ x86/ 目录下的平台特定优化文件
+          # 这些文件依赖平台汇编宏（FIXP_DBL 等），在 chromium 的 GN 构建环境下
+          # 缺少正确的头文件依赖链，会导致编译报错
+          SOURCES=""
+          while IFS= read -r f; do
+            # 转为相对于 BUILD.gn 所在目录的路径
+            rel="${f#$AAC_DST/}"
+            SOURCES="${SOURCES}    \"${rel}\",\n"
+          done < <(find "$AAC_DST/fdk-aac" -name "*.cpp" \
+                    ! -path "*/arm/*" \
+                    ! -path "*/win32/*" \
+                    ! -path "*/x86/*" \
+                    | sort)
+
+          cat > "$AAC_DST/BUILD.gn" << GNGEOF
+          config("aac_includes") {
+            include_dirs = [
+              "fdk-aac/libAACdec/include",
+              "fdk-aac/libAACenc/include",
+              "fdk-aac/libArithCoding/include",
+              "fdk-aac/libDRCdec/include",
+              "fdk-aac/libFDK/include",
+              "fdk-aac/libMpegTPDec/include",
+              "fdk-aac/libMpegTPEnc/include",
+              "fdk-aac/libPCMutils/include",
+              "fdk-aac/libSACdec/include",
+              "fdk-aac/libSACenc/include",
+              "fdk-aac/libSBRdec/include",
+              "fdk-aac/libSBRenc/include",
+              ".",
+            ]
+          }
+
+          static_library("aac") {
+            sources = [
+          $(printf "$SOURCES")
+            ]
+            defines = [ "SUPPRESS_BUILD_DATE_INFO" ]
+            public_configs = [ ":aac_includes" ]
+            configs -= [ "//build/config/compiler:chromium_code" ]
+            configs += [ "//build/config/compiler:no_chromium_code" ]
+            cflags = [ "-w" ]
+            cflags_cc = [ "-w" ]
+          }
+
+          group("rtc_aac") {
+            public_deps = [ ":aac" ]
+          }
+          GNGEOF
+
+          echo "---- sources 数量 ----"
+          grep -c '\.cpp' "$AAC_DST/BUILD.gn" || true
+          echo "---- BUILD.gn 前 50 行 ----"
+          head -50 "$AAC_DST/BUILD.gn"
 
       - name: 升级 clang 工具链（兼容 Xcode 15 SDK）
         run: |
