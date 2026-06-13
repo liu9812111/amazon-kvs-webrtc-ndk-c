@@ -2,6 +2,9 @@ name: Build iOS XCFramework
 
 on:
   workflow_dispatch:
+  push:
+    tags:
+      - 'v*.*.*'   # 打 tag 时自动触发并发布 Release
 
 jobs:
   build-ios:
@@ -10,7 +13,6 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v4
         with:
-          # 明确指定分支，避免在错误分支上触发导致 third_party/aac 缺失
           ref: add-aac-softcodec-mp4recording
           fetch-depth: 1
 
@@ -40,8 +42,13 @@ jobs:
           target_os = ["ios"]
           GCLIENT_EOF
 
+      # ============================================================
+      # 缓存层 1：gclient 依赖（third_party）
+      # 命中后跳过 gclient sync，节省约 20 分钟
+      # key 基于 DEPS 文件哈希，DEPS 变动时自动失效
+      # ============================================================
       - name: 恢复 gclient 依赖缓存
-        id: cache-restore
+        id: cache-gclient
         uses: actions/cache/restore@v4
         with:
           path: /Users/runner/src/third_party
@@ -52,7 +59,6 @@ jobs:
         run: |
           cd $HOME
           gclient sync --no-history --shallow --nohooks
-          # 修复 mac_toolchain.py 在 Python 3.12+ 环境下 pkg_resources 缺失的问题
           python3 -c "
           path = '/Users/runner/src/build/mac_toolchain.py'
           with open(path) as f:
@@ -70,12 +76,54 @@ jobs:
           "
           gclient runhooks
 
-      - name: 保存 gclient 依赖缓存（即使后续步骤失败也保存）
-        if: always() && steps.cache-restore.outputs.cache-hit != 'true'
+      - name: 保存 gclient 依赖缓存
+        if: always() && steps.cache-gclient.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: /Users/runner/src/third_party
           key: gclient-ios-${{ hashFiles('DEPS') }}
+
+      # ============================================================
+      # 缓存层 2：clang 工具链，没实现
+      # 工具链体积大、下载慢，单独缓存节省约 5 分钟
+      # key 基于 tools/clang/scripts/update.py 哈希
+      # ============================================================
+      - name: 升级 clang 工具链（兼容 Xcode 15 SDK）
+        run: |
+          cd /Users/runner/src
+          echo "当前 clang 版本："
+          third_party/llvm-build/Release+Asserts/bin/clang --version || true
+
+          curl -fsSL "https://chromium.googlesource.com/chromium/src/+/refs/branch-heads/5993/tools/clang/scripts/update.py?format=TEXT" \
+            | python3 -c "import base64,sys;sys.stdout.buffer.write(base64.b64decode(sys.stdin.read()))" \
+            > /tmp/clang_update.py
+
+          rm -rf third_party/llvm-build
+          python3.11 /tmp/clang_update.py --output-dir third_party/llvm-build/Release+Asserts
+
+          cp /tmp/clang_update.py tools/clang/scripts/update.py
+          sed -i '' -E 's/clang_version = "16[0-9.]*"/clang_version = "17"/' build/toolchain/toolchain.gni
+          echo "---- toolchain.gni 中的 clang_version ----"
+          grep -n 'clang_version' build/toolchain/toolchain.gni || true
+
+          echo "替换后 clang 版本："
+          third_party/llvm-build/Release+Asserts/bin/clang --version
+
+      # ============================================================
+      # 缓存层 3：编译中间产物（out/ 目录）
+      # 增量编译，只重新编译有变动的文件
+      # key 含源码哈希，源码变动时部分缓存仍可复用（restore-keys）
+      # 注意：out/ 缓存较大（可达 2-3GB），视磁盘限制决定是否启用
+      # ============================================================
+      - name: 恢复编译中间产物缓存
+        id: cache-out
+        uses: actions/cache/restore@v4
+        with:
+          path: /Users/runner/src/out
+          key: out-ios-${{ hashFiles('DEPS', 'sdk/**/*.gn', 'modules/**/*.gn') }}
+          restore-keys: out-ios-
+
+      # ---- 以下 patch 步骤保持不变 --------------------------------
 
       - name: 部署 third_party/aac 并生成正确的 BUILD.gn
         run: |
@@ -95,26 +143,15 @@ jobs:
           echo "---- fdk-aac 目录结构（2层）----"
           find "$AAC_DST/fdk-aac" -maxdepth 2 -type d | sort
 
-          # 用 Python 收集 sources 并生成 BUILD.gn，彻底避免 shell heredoc 的多行替换问题
           python3 - "$AAC_DST" << 'PYEOF'
           import os, sys
 
           aac_dst = sys.argv[1]
           fdk_root = os.path.join(aac_dst, "fdk-aac")
 
-          print("---- fdk-aac 所有子目录 ----")
-          for dirpath, dirnames, filenames in os.walk(fdk_root):
-              rel = os.path.relpath(dirpath, fdk_root)
-              cpp_count = len([f for f in filenames if f.endswith(".cpp")])
-              if cpp_count > 0:
-                  print(f"  {rel}  ({cpp_count} .cpp)") 
-
-          # 收集所有 .cpp，只取各库 src/ 目录下的顶层文件
-          # 排除所有平台特定子目录（arm/mips/x86/win32 等）
           excluded_dirs = {"arm", "win32", "x86", "fuzzer", "mips", "aarch64", "tests", "benchmark"}
           sources = []
           for dirpath, dirnames, filenames in os.walk(fdk_root):
-              # 剔除路径中包含任何排除目录名的路径
               path_parts = set(os.path.relpath(dirpath, aac_dst).split(os.sep))
               if path_parts & excluded_dirs:
                   continue
@@ -122,20 +159,14 @@ jobs:
                   if fname.endswith(".cpp"):
                       rel = os.path.relpath(os.path.join(dirpath, fname), aac_dst)
                       sources.append(rel)
-
           sources.sort()
           print(f"收集到 {len(sources)} 个 .cpp 文件")
 
-          # 动态检测所有 include 目录（libXXX/include 格式）
           include_dirs = ["fdk-aac", "."]
           for entry in sorted(os.listdir(fdk_root)):
               inc = os.path.join(fdk_root, entry, "include")
               if os.path.isdir(inc):
                   include_dirs.append(f"fdk-aac/{entry}/include")
-
-          print("include_dirs:")
-          for d in include_dirs:
-              print(f"  {d}")
 
           sources_str = "\n".join(f'    "{s}",' for s in sources)
           include_str = "\n".join(f'    "{d}",' for d in include_dirs)
@@ -158,6 +189,10 @@ jobs:
             cflags_cc = [ "-w" ]
           }}
 
+          group("aac_3p") {{
+            public_deps = [ ":aac" ]
+          }}
+
           group("rtc_aac") {{
             public_deps = [ ":aac" ]
           }}
@@ -169,91 +204,260 @@ jobs:
           print(f"BUILD.gn 已写入: {out_path}")
           PYEOF
 
-          echo "---- $AAC_DST 内容 ----"
-          ls -la "$AAC_DST"
-          echo "---- sources 数量 ----"
-          grep -c '\.cpp' "$AAC_DST/BUILD.gn" || true
-          echo "---- BUILD.gn 完整内容 ----"
-          cat "$AAC_DST/BUILD.gn"
+          echo "---- 确认 target 名 ----"
+          grep -n 'static_library\|group' "$AAC_DST/BUILD.gn"
 
-      - name: 升级 clang 工具链（兼容 Xcode 15 SDK）
+      - name: 生成 ffmpeg iOS config（复用 mac/arm64）
         run: |
-          cd /Users/runner/src
-          
-          # 读取已安装 clang 的实际 revision（无论来自缓存还是新下载）
-          ACTUAL_REV=$(third_party/llvm-build/Release+Asserts/bin/clang \
-            --version 2>&1 | grep -oE 'llvmorg-[^ ]+' | head -1 || true)
-          
-          if [ -z "$ACTUAL_REV" ] || [ "${{ steps.cache-clang.outputs.cache-hit }}" != "true" ]; then
-            echo "=== clang 不存在或缓存未命中，重新下载 ==="
-            curl -fsSL "https://chromium.googlesource.com/chromium/src/+/refs/branch-heads/5993/tools/clang/scripts/update.py?format=TEXT" \
-              | python3 -c "import base64,sys;sys.stdout.buffer.write(base64.b64decode(sys.stdin.read()))" \
-              > /tmp/clang_update.py
-          
-            rm -rf third_party/llvm-build
-            python3.11 /tmp/clang_update.py --output-dir third_party/llvm-build/Release+Asserts
-            cp /tmp/clang_update.py tools/clang/scripts/update.py
-          
-            ACTUAL_REV=$(third_party/llvm-build/Release+Asserts/bin/clang \
-              --version 2>&1 | grep -oE 'llvmorg-[^ ]+' | head -1)
-          fi
-          
-          echo "实际 clang revision: $ACTUAL_REV"
-          
-          # 无论缓存命中与否，始终将 update.py 中的期望版本对齐到实际安装版本
-          # 这样 GN 校验 --verify-version 时就不会报版本不匹配
-          python3 - "$ACTUAL_REV" << 'PYEOF'
-          import sys, re
-          
-          actual_rev = sys.argv[1]  # e.g. llvmorg-17-init-16420-g0c545a44-8
-          p = "/Users/runner/src/tools/clang/scripts/update.py"
+          FF=/Users/runner/src/third_party/ffmpeg
+          CFG_ROOT="$FF/chromium/config"
+
+          for BRAND in Chromium Chrome; do
+            SRC="$CFG_ROOT/$BRAND/mac/arm64"
+            DST="$CFG_ROOT/$BRAND/ios/arm64"
+            if [ -d "$SRC" ]; then
+              echo "==== 复用 $BRAND/mac/arm64 -> $BRAND/ios/arm64 ===="
+              rm -rf "$DST"
+              mkdir -p "$DST"
+              ( cd "$SRC" && tar cf - . ) | ( cd "$DST" && tar xf - )
+              echo "已生成: $DST"
+              ls -la "$DST"
+            else
+              echo "（$BRAND 无 mac/arm64，跳过）"
+            fi
+          done
+
+          echo "---- 校验 ios/arm64 config.h 存在 ----"
+          test -f "$CFG_ROOT/Chromium/ios/arm64/config.h" \
+            && echo "✅ Chromium/ios/arm64/config.h OK" \
+            || { echo "❌ 缺 config.h"; exit 1; }
+          test -f "$CFG_ROOT/Chromium/ios/arm64/libavutil/avconfig.h" \
+            && echo "✅ avconfig.h OK" \
+            || echo "⚠️ 无 avconfig.h（下一步会单独保证）"
+
+      - name: Patch BUILD.gn（去 lrt + 补 ffmpeg deps + 挂 recording）
+        run: |
+          SRC=/Users/runner/src
+          FF=$SRC/third_party/ffmpeg
+
+          echo "########## 修复2a-0 ##########"
+          echo "---- 确认 aarch64 实际文件名 ----"
+          ls -1 "$FF/libswresample/aarch64/" || echo "（无 aarch64 目录）"
+
+          python3 - << 'PYEOF'
+          import sys, re, os
+          ff = "/Users/runner/src/third_party/ffmpeg"
+          p = os.path.join(ff, "ffmpeg_generated.gni")
           s = open(p).read()
-          
-          # 替换 CLANG_REVISION 常量
-          s2 = re.sub(
-              r"(CLANG_REVISION\s*=\s*)['\"].*?['\"]",
-              lambda m: m.group(1) + f"'{actual_rev}'",
-              s
-          )
-          # 替换 CLANG_SUB_REVISION（设为 0 或保持原值均可）
-          s2 = re.sub(r"(CLANG_SUB_REVISION\s*=\s*)\d+", r"\g<1>0", s2)
-          
-          if s2 == s:
-              print(f"⚠️  update.py 无需修改（已匹配 {actual_rev}）")
-          else:
-              open(p, "w").write(s2)
-              print(f"✅ update.py 已对齐到 {actual_rev}")
-          
-          # 校验
-          v = open(p).read()
-          if actual_rev not in v:
-              print("❌ 回读校验失败，中止"); sys.exit(1)
-          print("✅ 回读确认")
+          before = s.count("is_ios")
+          s2 = re.sub(r'\bis_mac\b', '(is_mac || is_ios)', s)
+
+          base_srcs = [
+              "libavutil/audio_fifo.c",
+              "libswresample/audioconvert.c",
+              "libswresample/dither.c",
+              "libswresample/options.c",
+              "libswresample/rematrix.c",
+              "libswresample/resample.c",
+              "libswresample/resample_dsp.c",
+              "libswresample/swresample.c",
+              "libswresample/swresample_frame.c",
+              "libswresample/version.c",
+          ]
+          arm_srcs = [
+              "libswresample/aarch64/audio_convert_init.c",
+              "libswresample/aarch64/resample_init.c",
+          ]
+          arm_asm_srcs = [
+              "libswresample/aarch64/audio_convert_neon.S",
+              "libswresample/aarch64/resample.S",
+          ]
+
+          for asm in arm_asm_srcs:
+              if not os.path.exists(os.path.join(ff, asm)):
+                  print(f"❌ 汇编文件不存在: {asm}"); sys.exit(1)
+
+          def make_wrapper(rel):
+              flat = rel.replace("/", "_")
+              wrapper_name = "autorename_" + flat
+              wrapper_path = os.path.join(ff, wrapper_name)
+              with open(wrapper_path, "w") as w:
+                  w.write('#include "%s"\n' % rel)
+              return wrapper_name
+
+          base_wrappers = [make_wrapper(r) for r in base_srcs]
+          arm_wrappers = [make_wrapper(r) for r in arm_srcs]
+
+          lines = []
+          lines.append("")
+          lines.append("# ---- 手动补入 libswresample 与 audio_fifo ----")
+          lines.append("ffmpeg_c_sources += [")
+          for w in base_wrappers:
+              lines.append('  "%s",' % w)
+          lines.append("]")
+          lines.append('if ((is_mac || is_ios) && current_cpu == "arm64") {')
+          lines.append("  ffmpeg_c_sources += [")
+          for w in arm_wrappers:
+              lines.append('    "%s",' % w)
+          for asm in arm_asm_srcs:
+              lines.append('    "%s",' % asm)
+          lines.append("  ]")
+          lines.append("}")
+          lines.append("")
+          extra = "\n".join(lines)
+
+          if not s2.endswith("\n"):
+              s2 += "\n"
+          s2 = s2 + extra
+          open(p, "w").write(s2)
+
+          after_ios = open(p).read().count("is_ios")
+          if after_ios <= before:
+              print("❌ gni 未发生替换，中止"); sys.exit(1)
+          if "autorename_libswresample_swresample.c" not in open(p).read():
+              print("❌ swresample 包装未写入，中止"); sys.exit(1)
+          if not os.path.exists(os.path.join(ff, "autorename_libswresample_options.c")):
+              print("❌ 包装文件未生成，中止"); sys.exit(1)
+          if "audio_convert_neon.S" not in open(p).read():
+              print("❌ NEON 汇编未写入，中止"); sys.exit(1)
+          print(f"✅ gni 已补 iOS 源 + swresample + NEON 汇编")
           PYEOF
-          
-          # 同步修改 toolchain.gni 中的版本约束（如果有硬编码版本号）
-          MAJOR=$(echo "$ACTUAL_REV" | grep -oE 'llvmorg-([0-9]+)' | grep -oE '[0-9]+' | head -1)
-          if [ -n "$MAJOR" ]; then
-            sed -i '' -E "s/clang_version = \"[0-9]+\"/clang_version = \"$MAJOR\"/" \
-              build/toolchain/toolchain.gni 2>/dev/null || true
-            echo "✅ toolchain.gni clang_version 已更新为 $MAJOR"
-          fi
-          
-          echo "最终 clang 版本："
-          third_party/llvm-build/Release+Asserts/bin/clang --version
 
-      - name: 生成 FFmpeg iOS 配置头文件（avconfig.h）
+          echo "########## 修复2a-0b: 启用 CONFIG_SWRESAMPLE ##########"
+          for B in Chromium Chrome; do
+            CH="$FF/chromium/config/$B/ios/arm64/config.h"
+            [ -f "$CH" ] || continue
+            sed -i '' 's/#define CONFIG_SWRESAMPLE 0/#define CONFIG_SWRESAMPLE 1/' "$CH"
+          done
+
+          echo "########## 修复2a: ffmpeg 去掉 iOS 的 -lrt ##########"
+          sed -i '' 's/is_posix && !is_mac)/is_posix \&\& !is_mac \&\& !is_ios)/g' "$FF/BUILD.gn"
+
+          echo "########## 修复2a-2: ffmpeg_internal 强制 source_set ##########"
+          python3 - << 'PYEOF'
+          import sys
+          p = "/Users/runner/src/third_party/ffmpeg/BUILD.gn"
+          s = open(p).read()
+          target = 'link_target_type = "static_library"'
+          if target not in s:
+              print("❌ 未找到 link_target_type = static_library，结构变了，中止")
+              sys.exit(1)
+          s = s.replace(
+              target,
+              '# iOS framework 需要 .o 直接展开，改用 source_set\n  link_target_type = "source_set"'
+          )
+          open(p, "w").write(s)
+          v = open(p).read()
+          if 'link_target_type = "source_set"' not in v or 'link_target_type = "static_library"' in v:
+              print("❌ patch 写入后回读校验失败，中止")
+              sys.exit(1)
+          print("✅ ffmpeg_internal 已改为 source_set 并回读确认")
+          PYEOF
+
+          echo "########## 修复2a-3: 给 iOS 也加 _DARWIN_C_SOURCE ##########"
+          python3 - << 'PYEOF'
+          import sys
+          p = "/Users/runner/src/third_party/ffmpeg/BUILD.gn"
+          s = open(p).read()
+          anchor = '  defines = [\n    "HAVE_AV_CONFIG_H",'
+          if anchor in s:
+              s = s.replace(
+                  anchor,
+                  '  defines = [\n    "HAVE_AV_CONFIG_H",\n    "_DARWIN_C_SOURCE",',
+                  1
+              )
+              open(p, "w").write(s)
+              print("✅ 已给 ffmpeg_internal 无条件加 _DARWIN_C_SOURCE")
+          else:
+              print("❌ 未找到锚点，中止")
+              sys.exit(1)
+          PYEOF
+
+          echo "########## 修复2b: recording 补 ffmpeg deps ##########"
+          python3 - << 'PYEOF'
+          p = "/Users/runner/src/modules/recording/BUILD.gn"
+          s = open(p).read()
+          if '//third_party/ffmpeg"' not in s.replace('ffmpeg_dependent_config',''):
+              s = s.replace("deps = [\n  ]", 'deps = [\n    "//third_party/ffmpeg",\n  ]')
+              s = s.replace("deps = [ ]", 'deps = [ "//third_party/ffmpeg" ]')
+              open(p,"w").write(s)
+              print("recording deps 已补 ffmpeg")
+          else:
+              print("recording 已有 ffmpeg deps，跳过")
+          PYEOF
+
+          echo "########## 修复2c: backing_track 补 ffmpeg deps ##########"
+          python3 - << 'PYEOF'
+          p = "/Users/runner/src/modules/backing_track/BUILD.gn"
+          s = open(p).read()
+          import re
+          m = re.search(r'deps = \[(.*?)\]', s, re.S)
+          if m and '//third_party/ffmpeg"' not in m.group(1):
+              s = s.replace(
+                  '"../audio_mixer:audio_mixer_impl",',
+                  '"../audio_mixer:audio_mixer_impl",\n    "//third_party/ffmpeg",'
+              )
+              open(p,"w").write(s)
+              print("backing_track deps 已补 ffmpeg")
+          else:
+              print("backing_track 已有 ffmpeg deps，跳过")
+          PYEOF
+
+          echo "########## 修复4: sdk framework 挂上 recording ##########"
+          python3 - << 'PYEOF'
+          p = "/Users/runner/src/sdk/BUILD.gn"
+          s = open(p).read()
+          if '//modules/recording:recording' not in s:
+              s = s.replace(
+                  '"//modules/backing_track:backing_track",',
+                  '"//modules/backing_track:backing_track",\n          "//modules/recording:recording",'
+              )
+              open(p,"w").write(s)
+              print("sdk framework 已挂 recording")
+          else:
+              print("sdk 已挂 recording，跳过")
+          PYEOF
+
+      - name: 给 aac/ffmpeg/openh264 补 license 声明
         run: |
-          FFMPEG_SRC="/Users/runner/src/third_party/ffmpeg"
-          FFMPEG_OUT="/Users/runner/src/out/ffmpeg-ios-config"
-          mkdir -p "$FFMPEG_OUT"
+          python3 - << 'PYEOF'
+          p = "/Users/runner/src/tools_webrtc/libs/generate_licenses.py"
+          s = open(p).read()
 
-          cd "$FFMPEG_SRC"
+          anchor = "LIB_TO_LICENSES_DICT = {"
+          if anchor not in s:
+              print("❌ 未找到 LIB_TO_LICENSES_DICT，结构变了，中止")
+              raise SystemExit(1)
 
-          # 手动生成 avconfig.h（最简单可靠的方案：直接写入）
-          # 无需完整 configure，avconfig.h 内容在 iOS arm64 下是固定的
-          mkdir -p "$FFMPEG_SRC/libavutil"
-          cat > "$FFMPEG_SRC/libavutil/avconfig.h" << 'EOF'
+          entries = (
+              "    'aac': ['third_party/aac/fdk-aac/NOTICE'],\n"
+              "    'ffmpeg': ['third_party/ffmpeg/LICENSE.md'],\n"
+              "    'openh264': ['third_party/openh264/src/LICENSE'],\n"
+          )
+
+          if "'aac':" in s and "'ffmpeg':" in s and "'openh264':" in s:
+              print("三个 license 声明已存在，跳过")
+          else:
+              s = s.replace(anchor, anchor + "\n" + entries, 1)
+              open(p, "w").write(s)
+              print("✅ 已补 aac/ffmpeg/openh264 license 声明")
+
+          v = open(p).read()
+          for k in ("'aac'", "'ffmpeg'", "'openh264'"):
+              if k not in v:
+                  print(f"❌ {k} 未写入，中止"); raise SystemExit(1)
+          print("✅ 三个声明回读确认")
+          PYEOF
+
+      - name: 保证 FFmpeg avconfig.h 存在（iOS arm64）
+        run: |
+          FF=/Users/runner/src/third_party/ffmpeg
+          for BRAND in Chromium Chrome; do
+            DSTDIR="$FF/chromium/config/$BRAND/ios/arm64/libavutil"
+            [ -d "$FF/chromium/config/$BRAND/ios/arm64" ] || continue
+            mkdir -p "$DSTDIR"
+            if [ ! -f "$DSTDIR/avconfig.h" ]; then
+              cat > "$DSTDIR/avconfig.h" << 'EOF'
           /* Generated for iOS arm64 */
           #ifndef AVUTIL_AVCONFIG_H
           #define AVUTIL_AVCONFIG_H
@@ -261,30 +465,125 @@ jobs:
           #define AV_HAVE_FAST_UNALIGNED 1
           #endif /* AVUTIL_AVCONFIG_H */
           EOF
+              echo "已补 $DSTDIR/avconfig.h"
+            else
+              echo "$DSTDIR/avconfig.h 已存在"
+            fi
+          done
 
-          echo "---- avconfig.h 内容 ----"
-          cat "$FFMPEG_SRC/libavutil/avconfig.h"
-
+      # ============================================================
+      # 编译（增量：有 out/ 缓存时 ninja 只编译变动文件）
+      # ============================================================
       - name: 编译 iOS XCFramework
         run: |
           export PATH="/opt/homebrew/opt/python@3.11/bin:$HOME/depot_tools:$PATH"
           export PYTHONPATH="$HOME/depot_tools"
           cd /Users/runner/src
-          # treat_warnings_as_errors=false：新版 clang 会对旧代码报一些新告警，
-          # 关掉 -Werror 避免被无关告警打断
           python3.11 tools_webrtc/ios/build_ios_libs.py \
             --output out/ios-release \
             --arch arm64 \
             --build_config release \
-            --extra-gn-args "treat_warnings_as_errors=false"
+            --extra-gn-args "treat_warnings_as_errors=false is_component_ffmpeg=false"
 
-      - name: 打包成 zip
+      # ============================================================
+      # 保存编译中间产物（编译成功后才保存，避免缓存坏产物）
+      # ============================================================
+      - name: 保存编译中间产物缓存
+        if: success() && steps.cache-out.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: /Users/runner/src/out
+          key: out-ios-${{ hashFiles('DEPS', 'sdk/**/*.gn', 'modules/**/*.gn') }}
+
+      # ============================================================
+      # 打包 + 计算 checksum（SPM 必须）
+      # ============================================================
+      - name: 打包成 zip 并计算 checksum
+        id: package
         run: |
           cd /Users/runner/src
           ls -la out/ios-release
           zip -ry $GITHUB_WORKSPACE/WebRTC.xcframework.zip out/ios-release/WebRTC.xcframework
 
-      - name: 上传为 Artifact（可下载）
+          # 计算 SPM 所需的 checksum
+          CHECKSUM=$(swift package compute-checksum $GITHUB_WORKSPACE/WebRTC.xcframework.zip)
+          echo "checksum=$CHECKSUM" >> $GITHUB_OUTPUT
+          echo "✅ Checksum: $CHECKSUM"
+
+      # ============================================================
+      # 仅在打 tag 时发布 GitHub Release
+      # workflow_dispatch 手动触发时只上传 Artifact
+      # ============================================================
+      - name: 发布到 GitHub Release（打 tag 时）
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          body: |
+            ## WebRTC iOS XCFramework ${{ github.ref_name }}
+
+            ### 通过 Swift Package Manager 使用
+
+            在 `Package.swift` 中添加：
+            ```swift
+            .binaryTarget(
+                name: "WebRTC",
+                url: "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/WebRTC.xcframework.zip",
+                checksum: "${{ steps.package.outputs.checksum }}"
+            )
+            ```
+
+            或直接在 Xcode 中添加包地址：
+            `https://github.com/${{ github.repository }}`
+          files: ${{ github.workspace }}/WebRTC.xcframework.zip
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ============================================================
+      # 更新 Package.swift（打 tag 时自动提交到仓库）
+      # ============================================================
+      - name: 更新 Package.swift
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          TAG=${{ github.ref_name }}
+          CHECKSUM=${{ steps.package.outputs.checksum }}
+          REPO=${{ github.repository }}
+
+          cat > $GITHUB_WORKSPACE/Package.swift << EOF
+          // swift-tools-version:5.3
+          import PackageDescription
+
+          let package = Package(
+              name: "WebRTC",
+              platforms: [.iOS(.v13)],
+              products: [
+                  .library(name: "WebRTC", targets: ["WebRTC"])
+              ],
+              targets: [
+                  .binaryTarget(
+                      name: "WebRTC",
+                      url: "https://github.com/${REPO}/releases/download/${TAG}/WebRTC.xcframework.zip",
+                      checksum: "${CHECKSUM}"
+                  )
+              ]
+          )
+          EOF
+
+          echo "✅ Package.swift 已生成："
+          cat $GITHUB_WORKSPACE/Package.swift
+
+          # 提交 Package.swift 到仓库
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Package.swift
+          git commit -m "chore: update Package.swift for $TAG [skip ci]" || echo "无变动，跳过提交"
+          git push origin HEAD:add-aac-softcodec-mp4recording || echo "推送失败（可能无写权限，手动更新 Package.swift）"
+
+      # 手动触发时只上传 Artifact（保留原有行为）
+      - name: 上传为 Artifact（手动触发时）
+        if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
           name: WebRTC-iOS-XCFramework
