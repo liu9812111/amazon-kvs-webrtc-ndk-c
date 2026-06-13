@@ -178,67 +178,56 @@ jobs:
 
       - name: 升级 clang 工具链（兼容 Xcode 15 SDK）
         run: |
+          set -e
           cd /Users/runner/src
-          
-          # 读取已安装 clang 的实际 revision（无论来自缓存还是新下载）
+
+          # 读取实际安装的 clang revision
           ACTUAL_REV=$(third_party/llvm-build/Release+Asserts/bin/clang \
             --version 2>&1 | grep -oE 'llvmorg-[^ ]+' | head -1 || true)
-          
-          if [ -z "$ACTUAL_REV" ] || [ "${{ steps.cache-clang.outputs.cache-hit }}" != "true" ]; then
-            echo "=== clang 不存在或缓存未命中，重新下载 ==="
+
+          if [ -z "$ACTUAL_REV" ]; then
+            echo "=== clang 不存在，重新下载 ==="
             curl -fsSL "https://chromium.googlesource.com/chromium/src/+/refs/branch-heads/5993/tools/clang/scripts/update.py?format=TEXT" \
               | python3 -c "import base64,sys;sys.stdout.buffer.write(base64.b64decode(sys.stdin.read()))" \
               > /tmp/clang_update.py
-          
             rm -rf third_party/llvm-build
             python3.11 /tmp/clang_update.py --output-dir third_party/llvm-build/Release+Asserts
             cp /tmp/clang_update.py tools/clang/scripts/update.py
-          
             ACTUAL_REV=$(third_party/llvm-build/Release+Asserts/bin/clang \
               --version 2>&1 | grep -oE 'llvmorg-[^ ]+' | head -1)
           fi
-          
+
           echo "实际 clang revision: $ACTUAL_REV"
-          
-          # 无论缓存命中与否，始终将 update.py 中的期望版本对齐到实际安装版本
-          # 这样 GN 校验 --verify-version 时就不会报版本不匹配
-          python3 - "$ACTUAL_REV" << 'PYEOF'
-          import sys, re
-          
-          actual_rev = sys.argv[1]  # e.g. llvmorg-17-init-16420-g0c545a44-8
-          p = "/Users/runner/src/tools/clang/scripts/update.py"
-          s = open(p).read()
-          
-          # 替换 CLANG_REVISION 常量
-          s2 = re.sub(
-              r"(CLANG_REVISION\s*=\s*)['\"].*?['\"]",
-              lambda m: m.group(1) + f"'{actual_rev}'",
-              s
-          )
-          # 替换 CLANG_SUB_REVISION（设为 0 或保持原值均可）
-          s2 = re.sub(r"(CLANG_SUB_REVISION\s*=\s*)\d+", r"\g<1>0", s2)
-          
-          if s2 == s:
-              print(f"⚠️  update.py 无需修改（已匹配 {actual_rev}）")
-          else:
-              open(p, "w").write(s2)
-              print(f"✅ update.py 已对齐到 {actual_rev}")
-          
-          # 校验
-          v = open(p).read()
-          if actual_rev not in v:
-              print("❌ 回读校验失败，中止"); sys.exit(1)
-          print("✅ 回读确认")
-          PYEOF
-          
-          # 同步修改 toolchain.gni 中的版本约束（如果有硬编码版本号）
-          MAJOR=$(echo "$ACTUAL_REV" | grep -oE 'llvmorg-([0-9]+)' | grep -oE '[0-9]+' | head -1)
+
+          # 将 update.py 中的期望版本对齐到实际安装版本
+          # 注意：用 Python -c 单行写文件路径，避免 heredoc 缩进污染 Python 代码
+          cat > /tmp/patch_clang.py << 'EOF'
+import sys, re
+actual_rev = sys.argv[1]
+p = "/Users/runner/src/tools/clang/scripts/update.py"
+s = open(p).read()
+s2 = re.sub(r"(CLANG_REVISION\s*=\s*)['\"].*?['\"]", lambda m: m.group(1) + f"'{actual_rev}'", s)
+s2 = re.sub(r"(CLANG_SUB_REVISION\s*=\s*)\d+", r"\g<1>0", s2)
+if s2 == s:
+    print(f"WARNING: update.py no change needed for {actual_rev}")
+else:
+    open(p, "w").write(s2)
+    print(f"OK: update.py patched to {actual_rev}")
+v = open(p).read()
+if actual_rev not in v:
+    print("FAIL: patch verify failed"); sys.exit(1)
+print("OK: verify passed")
+EOF
+          python3 /tmp/patch_clang.py "$ACTUAL_REV"
+
+          # 同步修改 toolchain.gni 中的硬编码版本号
+          MAJOR=$(echo "$ACTUAL_REV" | sed -E 's/llvmorg-([0-9]+).*/\1/')
           if [ -n "$MAJOR" ]; then
             sed -i '' -E "s/clang_version = \"[0-9]+\"/clang_version = \"$MAJOR\"/" \
               build/toolchain/toolchain.gni 2>/dev/null || true
-            echo "✅ toolchain.gni clang_version 已更新为 $MAJOR"
+            echo "toolchain.gni clang_version => $MAJOR"
           fi
-          
+
           echo "最终 clang 版本："
           third_party/llvm-build/Release+Asserts/bin/clang --version
 
