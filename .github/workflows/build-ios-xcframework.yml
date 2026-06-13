@@ -181,45 +181,27 @@ jobs:
           set -e
           cd /Users/runner/src
 
-          ACTUAL_REV=$(third_party/llvm-build/Release+Asserts/bin/clang \
-            --version 2>&1 | grep -oE 'llvmorg-[^ ]+' | head -1 || true)
+          ACTUAL_REV=$(third_party/llvm-build/Release+Asserts/bin/clang --version 2>&1 | grep -oE 'llvmorg-[^ ]+' | head -1 || true)
 
           if [ -z "$ACTUAL_REV" ]; then
             echo "=== clang 不存在，重新下载 ==="
-            curl -fsSL "https://chromium.googlesource.com/chromium/src/+/refs/branch-heads/5993/tools/clang/scripts/update.py?format=TEXT" \
-              | python3 -c "import base64,sys;sys.stdout.buffer.write(base64.b64decode(sys.stdin.read()))" \
-              > /tmp/clang_update.py
+            curl -fsSL "https://chromium.googlesource.com/chromium/src/+/refs/branch-heads/5993/tools/clang/scripts/update.py?format=TEXT" | python3 -c "import base64,sys;sys.stdout.buffer.write(base64.b64decode(sys.stdin.read()))" > /tmp/clang_update.py
             rm -rf third_party/llvm-build
             python3.11 /tmp/clang_update.py --output-dir third_party/llvm-build/Release+Asserts
             cp /tmp/clang_update.py tools/clang/scripts/update.py
-            ACTUAL_REV=$(third_party/llvm-build/Release+Asserts/bin/clang \
-              --version 2>&1 | grep -oE 'llvmorg-[^ ]+' | head -1)
+            ACTUAL_REV=$(third_party/llvm-build/Release+Asserts/bin/clang --version 2>&1 | grep -oE 'llvmorg-[^ ]+' | head -1)
           fi
 
           echo "实际 clang revision: $ACTUAL_REV"
 
-          python3 -c "
-import sys, re
-actual_rev = sys.argv[1]
-p = '/Users/runner/src/tools/clang/scripts/update.py'
-s = open(p).read()
-s2 = re.sub(r\"(CLANG_REVISION\s*=\s*)['\\\"].*?['\\\"]\", lambda m: m.group(1) + repr(actual_rev), s)
-s2 = re.sub(r'(CLANG_SUB_REVISION\s*=\s*)\d+', r'\g<1>0', s2)
-if s2 == s:
-    print('WARNING: update.py no change needed for ' + actual_rev)
-else:
-    open(p, 'w').write(s2)
-    print('OK: update.py patched to ' + actual_rev)
-v = open(p).read()
-if actual_rev not in v:
-    print('FAIL: patch verify failed'); sys.exit(1)
-print('OK: verify passed')
-" "$ACTUAL_REV"
+          echo "aW1wb3J0IHN5cywgcmUKYWN0dWFsX3JldiA9IHN5cy5hcmd2WzFdCnAgPSAnL1VzZXJzL3J1bm5lci9zcmMvdG9vbHMvY2xhbmcvc2NyaXB0cy91cGRhdGUucHknCnMgPSBvcGVuKHApLnJlYWQoKQpzMiA9IHJlLnN1YihyJyhDTEFOR19SRVZJU0lPTlxzKj1ccyopW1wnIl0uKj9bXCciXScsIGxhbWJkYSBtOiBtLmdyb3VwKDEpICsgcmVwcihh" | base64 -d > /tmp/patch_clang.py
+          echo "Y3R1YWxfcmV2KSwgcykKczIgPSByZS5zdWIocichKENMQU5HX1NVQl9SRVZJU0lPTlxzKj1ccyopXGQrJywgcidcZzwxPjAnLCBzMikKaWYgczIgPT0gczoKICAgIHByaW50KCdXQVJOSU5HOiBubyBjaGFuZ2UgbmVlZGVkJykKZWxzZToKICAgIG9wZW4ocCwgJ3cnKS53cml0ZShzMikKICAgIHByaW50KCdPSzogcGF0Y2hlZCB0byAnICsgYWN0dWFsX3JldikKdiA9" | base64 -d >> /tmp/patch_clang.py
+          echo "IG9wZW4ocCkucmVhZCgpCmlmIGFjdHVhbF9yZXYgbm90IGluIHY6CiAgICBwcmludCgnRkFJTDogdmVyaWZ5IGZhaWxlZCcpCiAgICBzeXMuZXhpdCgxKQpwcmludCgnT0s6IHZlcmlmeSBwYXNzZWQnKQo=" | base64 -d >> /tmp/patch_clang.py
+          python3 /tmp/patch_clang.py "$ACTUAL_REV"
 
           MAJOR=$(echo "$ACTUAL_REV" | sed -E 's/llvmorg-([0-9]+).*/\1/')
           if [ -n "$MAJOR" ]; then
-            sed -i '' -E "s/clang_version = \"[0-9]+\"/clang_version = \"$MAJOR\"/" \
-              build/toolchain/toolchain.gni 2>/dev/null || true
+            sed -i '' -E "s/clang_version = \"[0-9]+\"/clang_version = \"$MAJOR\"/" build/toolchain/toolchain.gni 2>/dev/null || true
             echo "toolchain.gni clang_version => $MAJOR"
           fi
 
