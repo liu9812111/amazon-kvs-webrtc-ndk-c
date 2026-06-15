@@ -495,6 +495,12 @@ jobs:
           path: /Users/runner/src/out
           key: out-ios-${{ hashFiles('DEPS', 'sdk/**/*.gn', 'modules/**/*.gn') }}
 
+      - name: 签名 xcframework（ad-hoc）
+        run: |
+          codesign --sign - --force --deep /Users/runner/src/out/ios-release/WebRTC.xcframework
+          echo "✅ 签名完成"
+          codesign -dv /Users/runner/src/out/ios-release/WebRTC.xcframework
+
       # ============================================================
       # 打包 + 计算 checksum（SPM 必须）
       # ============================================================
