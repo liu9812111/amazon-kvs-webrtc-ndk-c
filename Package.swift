@@ -10,8 +10,8 @@ let package = Package(
     targets: [
         .binaryTarget(
             name: "WebRTC",
-            url: "https://github.com/liu9812111/amazon-kvs-webrtc-ndk-c/releases/download/v1.0.0/WebRTC.xcframework.zip",
-            checksum: "013b465aa650e62c50cb11f79d05e98226e56416bc4ed910cae29c9145bfb502"
+            url: "https://github.com/liu9812111/amazon-kvs-webrtc-ndk-c/releases/download/v2.0.0/WebRTC.xcframework.zip",
+            checksum: "a298728b0e4f6b28c562c9b18dec2550b2b7f949fa50e46c9a20916abf8da0aa"
         )
     ]
 )
