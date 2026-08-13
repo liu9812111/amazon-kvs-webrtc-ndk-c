@@ -367,28 +367,40 @@ jobs:
           done
 
       # ============================================================
-      # 修复 rtc_use_recorder 的 Value collision：
-      # build_overrides/build.gni 里 `if (is_ios || is_android)` 才把
-      # rtc_use_recorder 置 true，其余平台（包括 mac）走 else 分支被
-      # 硬编码成 false，这和 webrtc.gni 里 declare_args 默认值 true
-      # 冲突，导致 gn gen 报 "Value collision"。给条件加上 is_mac 即可。
+      # 修复 build_overrides/build.gni 里的 Value collision：
+      # 这个文件里有两处平台判断（rtc_use_h265 / rtc_use_recorder+
+      # rtc_use_bt_mixer）只写了 is_win/is_ios/is_android，没算上
+      # is_mac，导致 else 分支把值硬编码成 false，和 webrtc.gni 里
+      # declare_args 的默认值 true 冲突（"Value collision"）。
+      # 两处都补上 is_mac。
       # ============================================================
-      - name: Patch build_overrides/build.gni（mac 也启用 recorder）
+      - name: Patch build_overrides/build.gni（mac 也走 true 分支）
         run: |
           python3 - << 'PYEOF'
           p = "/Users/runner/src/build_overrides/build.gni"
           s = open(p).read()
-          old = "if (is_ios || is_android) {"
-          new = "if (is_ios || is_android || is_mac) {"
-          if old in s:
-              s = s.replace(old, new, 1)
+
+          replacements = [
+              ("if (is_win || is_ios || is_android) {",
+               "if (is_win || is_ios || is_android || is_mac) {"),
+              ("if (is_ios || is_android) {",
+               "if (is_ios || is_android || is_mac) {"),
+          ]
+
+          changed = False
+          for old, new in replacements:
+              if old in s:
+                  s = s.replace(old, new, 1)
+                  changed = True
+                  print(f"✅ 已替换: {old}")
+              elif new in s:
+                  print(f"已经 patch 过，跳过: {new}")
+              else:
+                  print(f"❌ 未找到预期结构: {old}，文件可能已变化，需要人工确认")
+                  raise SystemExit(1)
+
+          if changed:
               open(p, "w").write(s)
-              print("✅ 已把 is_mac 加入 rtc_use_recorder 开启条件")
-          elif new in s:
-              print("已经 patch 过，跳过")
-          else:
-              print("❌ 未找到预期的 if (is_ios || is_android) { 结构，文件可能已变化，需要人工确认")
-              raise SystemExit(1)
           PYEOF
 
       # ============================================================
