@@ -1,0 +1,474 @@
+name: Build macOS x86_64 XCFramework
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'macos-v*.*.*'   # 用独立的 tag 前缀，避免和 iOS 的 v*.*.* 冲突触发
+
+jobs:
+  build-macos-x64:
+    runs-on: macos-14   # Apple Silicon runner，交叉编译 x86_64 是标准做法
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          ref: add-aac-softcodec-mp4recording
+          fetch-depth: 1
+
+      - name: 安装 Python 3.11 和 setuptools
+        run: |
+          brew install python@3.11
+          /opt/homebrew/opt/python@3.11/bin/python3.11 -m pip install setuptools --break-system-packages
+
+      - name: 安装 depot_tools
+        run: |
+          git clone --depth=1 https://chromium.googlesource.com/chromium/tools/depot_tools.git $HOME/depot_tools
+          echo "$HOME/depot_tools" >> $GITHUB_PATH
+
+      - name: 写入 gclient 配置
+        run: |
+          cd $HOME
+          cat > .gclient << 'GCLIENT_EOF'
+          solutions = [
+            {
+              "name": "src",
+              "url": "https://github.com/liu9812111/amazon-kvs-webrtc-ndk-c.git@add-aac-softcodec-mp4recording",
+              "deps_file": "DEPS",
+              "managed": False,
+              "custom_vars": {},
+            },
+          ]
+          target_os = ["mac"]
+          GCLIENT_EOF
+
+      # ============================================================
+      # 缓存层 1：gclient 依赖（third_party）
+      # ============================================================
+      - name: 恢复 gclient 依赖缓存
+        id: cache-gclient
+        uses: actions/cache/restore@v4
+        with:
+          path: /Users/runner/src/third_party
+          key: gclient-mac-${{ hashFiles('DEPS') }}
+          restore-keys: gclient-mac-
+
+      - name: 同步依赖并修复后执行 hooks
+        run: |
+          cd $HOME
+          gclient sync --no-history --shallow --nohooks
+          python3 -c "
+          path = '/Users/runner/src/build/mac_toolchain.py'
+          with open(path) as f:
+              content = f.read()
+          if 'except ImportError' not in content:
+              content = content.replace(
+                  'import pkg_resources',
+                  'try:\n    import pkg_resources\nexcept ImportError:\n    pkg_resources = None'
+              )
+              with open(path, 'w') as f:
+                  f.write(content)
+              print('mac_toolchain.py 修复完成')
+          else:
+              print('mac_toolchain.py 已修复过，跳过')
+          "
+          gclient runhooks
+
+      - name: 保存 gclient 依赖缓存
+        if: always() && steps.cache-gclient.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: /Users/runner/src/third_party
+          key: gclient-mac-${{ hashFiles('DEPS') }}
+
+      - name: 升级 clang 工具链（兼容 Xcode 15 SDK）
+        run: |
+          cd /Users/runner/src
+          echo "当前 clang 版本："
+          third_party/llvm-build/Release+Asserts/bin/clang --version || true
+
+          curl -fsSL "https://chromium.googlesource.com/chromium/src/+/refs/branch-heads/5993/tools/clang/scripts/update.py?format=TEXT" \
+            | python3 -c "import base64,sys;sys.stdout.buffer.write(base64.b64decode(sys.stdin.read()))" \
+            > /tmp/clang_update.py
+
+          rm -rf third_party/llvm-build
+          python3.11 /tmp/clang_update.py --output-dir third_party/llvm-build/Release+Asserts
+
+          cp /tmp/clang_update.py tools/clang/scripts/update.py
+          sed -i '' -E 's/clang_version = "16[0-9.]*"/clang_version = "17"/' build/toolchain/toolchain.gni
+          echo "---- toolchain.gni 中的 clang_version ----"
+          grep -n 'clang_version' build/toolchain/toolchain.gni || true
+
+          echo "替换后 clang 版本："
+          third_party/llvm-build/Release+Asserts/bin/clang --version
+
+      # ============================================================
+      # 缓存层 2：编译中间产物（out/ 目录）
+      # ============================================================
+      - name: 恢复编译中间产物缓存
+        id: cache-out
+        uses: actions/cache/restore@v4
+        with:
+          path: /Users/runner/src/out
+          key: out-mac-x64-${{ hashFiles('DEPS', 'sdk/**/*.gn', 'modules/**/*.gn') }}
+          restore-keys: out-mac-x64-
+
+      # ---- 以下 patch 步骤和 iOS 脚本完全一致（AAC/ffmpeg 补丁与平台无关）----
+
+      - name: 部署 third_party/aac 并生成正确的 BUILD.gn
+        run: |
+          AAC_SRC="$GITHUB_WORKSPACE/third_party/aac"
+          AAC_DST="/Users/runner/src/third_party/aac"
+
+          rm -rf "$AAC_DST"
+          mkdir -p "$AAC_DST"
+
+          if [ ! -d "$AAC_SRC/fdk-aac" ]; then
+            git clone --depth=1 https://github.com/mstorsjo/fdk-aac.git "$AAC_DST/fdk-aac"
+            rm -rf "$AAC_DST/fdk-aac/.git"
+          else
+            cp -R "$AAC_SRC/." "$AAC_DST/"
+          fi
+
+          echo "---- fdk-aac 目录结构（2层）----"
+          find "$AAC_DST/fdk-aac" -maxdepth 2 -type d | sort
+
+          python3 - "$AAC_DST" << 'PYEOF'
+          import os, sys
+
+          aac_dst = sys.argv[1]
+          fdk_root = os.path.join(aac_dst, "fdk-aac")
+
+          excluded_dirs = {"arm", "win32", "x86", "fuzzer", "mips", "aarch64", "tests", "benchmark"}
+          sources = []
+          for dirpath, dirnames, filenames in os.walk(fdk_root):
+              path_parts = set(os.path.relpath(dirpath, aac_dst).split(os.sep))
+              if path_parts & excluded_dirs:
+                  continue
+              for fname in sorted(filenames):
+                  if fname.endswith(".cpp"):
+                      rel = os.path.relpath(os.path.join(dirpath, fname), aac_dst)
+                      sources.append(rel)
+          sources.sort()
+          print(f"收集到 {len(sources)} 个 .cpp 文件")
+
+          include_dirs = ["fdk-aac", "."]
+          for entry in sorted(os.listdir(fdk_root)):
+              inc = os.path.join(fdk_root, entry, "include")
+              if os.path.isdir(inc):
+                  include_dirs.append(f"fdk-aac/{entry}/include")
+
+          sources_str = "\n".join(f'    "{s}",' for s in sources)
+          include_str = "\n".join(f'    "{d}",' for d in include_dirs)
+
+          build_gn = f'''config("aac_includes") {{
+            include_dirs = [
+          {include_str}
+            ]
+          }}
+
+          static_library("aac") {{
+            sources = [
+          {sources_str}
+            ]
+            defines = [ "SUPPRESS_BUILD_DATE_INFO" ]
+            public_configs = [ ":aac_includes" ]
+            configs -= [ "//build/config/compiler:chromium_code" ]
+            configs += [ "//build/config/compiler:no_chromium_code" ]
+            cflags = [ "-w" ]
+            cflags_cc = [ "-w" ]
+          }}
+
+          group("aac_3p") {{
+            public_deps = [ ":aac" ]
+          }}
+
+          group("rtc_aac") {{
+            public_deps = [ ":aac" ]
+          }}
+          '''
+
+          out_path = os.path.join(aac_dst, "BUILD.gn")
+          with open(out_path, "w") as f:
+              f.write(build_gn)
+          print(f"BUILD.gn 已写入: {out_path}")
+          PYEOF
+
+          echo "---- 确认 target 名 ----"
+          grep -n 'static_library\|group' "$AAC_DST/BUILD.gn"
+
+      # ============================================================
+      # 注意：mac/x64 本身就是 Chromium ffmpeg config 原生支持的平台，
+      # 通常 third_party/ffmpeg/chromium/config/{Chromium,Chrome}/mac/x64
+      # 已经自带，不需要像 iOS 那样从 mac/arm64 拷贝伪造。
+      # 这里只做存在性校验，缺失才报错（而不是盲目拷贝，因为 x64/arm64
+      # 的 SIMD 相关宏定义不一样，拷贝 arm64 配置去当 x64 用是错的）。
+      # ============================================================
+      - name: 校验 ffmpeg mac/x64 config 是否存在
+        run: |
+          CFG_ROOT="/Users/runner/src/third_party/ffmpeg/chromium/config"
+          test -f "$CFG_ROOT/Chromium/mac/x64/config.h" \
+            && echo "✅ Chromium/mac/x64/config.h OK" \
+            || { echo "❌ 缺 Chromium/mac/x64/config.h，说明这个仓库没有原生 mac/x64 config，需要人工确认目录结构"; exit 1; }
+          test -f "$CFG_ROOT/Chromium/mac/x64/libavutil/avconfig.h" \
+            && echo "✅ avconfig.h OK" \
+            || echo "⚠️ 无 avconfig.h，下一步会单独补"
+
+      - name: Patch BUILD.gn（补 ffmpeg deps + 挂 recording，平台无关）
+        run: |
+          SRC=/Users/runner/src
+          FF=$SRC/third_party/ffmpeg
+
+          python3 - << 'PYEOF'
+          import sys, re, os
+          ff = "/Users/runner/src/third_party/ffmpeg"
+          p = os.path.join(ff, "ffmpeg_generated.gni")
+          s = open(p).read()
+
+          base_srcs = [
+              "libavutil/audio_fifo.c",
+              "libswresample/audioconvert.c",
+              "libswresample/dither.c",
+              "libswresample/options.c",
+              "libswresample/rematrix.c",
+              "libswresample/resample.c",
+              "libswresample/resample_dsp.c",
+              "libswresample/swresample.c",
+              "libswresample/swresample_frame.c",
+              "libswresample/version.c",
+          ]
+
+          def make_wrapper(rel):
+              flat = rel.replace("/", "_")
+              wrapper_name = "autorename_" + flat
+              wrapper_path = os.path.join(ff, wrapper_name)
+              with open(wrapper_path, "w") as w:
+                  w.write('#include "%s"\n' % rel)
+              return wrapper_name
+
+          base_wrappers = [make_wrapper(r) for r in base_srcs]
+
+          if "autorename_libswresample_swresample.c" not in s:
+              lines = []
+              lines.append("")
+              lines.append("# ---- 手动补入 libswresample 与 audio_fifo ----")
+              lines.append("ffmpeg_c_sources += [")
+              for w in base_wrappers:
+                  lines.append('  "%s",' % w)
+              lines.append("]")
+              lines.append("")
+              extra = "\n".join(lines)
+              if not s.endswith("\n"):
+                  s += "\n"
+              s = s + extra
+              open(p, "w").write(s)
+              print("✅ gni 已补 swresample 源文件")
+          else:
+              print("swresample 源已存在，跳过")
+          PYEOF
+
+          echo "########## 启用 CONFIG_SWRESAMPLE ##########"
+          for B in Chromium Chrome; do
+            CH="$FF/chromium/config/$B/mac/x64/config.h"
+            [ -f "$CH" ] || continue
+            sed -i '' 's/#define CONFIG_SWRESAMPLE 0/#define CONFIG_SWRESAMPLE 1/' "$CH"
+          done
+
+          echo "########## recording 补 ffmpeg deps ##########"
+          python3 - << 'PYEOF'
+          p = "/Users/runner/src/modules/recording/BUILD.gn"
+          s = open(p).read()
+          if '//third_party/ffmpeg"' not in s.replace('ffmpeg_dependent_config',''):
+              s = s.replace("deps = [\n  ]", 'deps = [\n    "//third_party/ffmpeg",\n  ]')
+              s = s.replace("deps = [ ]", 'deps = [ "//third_party/ffmpeg" ]')
+              open(p,"w").write(s)
+              print("recording deps 已补 ffmpeg")
+          else:
+              print("recording 已有 ffmpeg deps，跳过")
+          PYEOF
+
+          echo "########## backing_track 补 ffmpeg deps ##########"
+          python3 - << 'PYEOF'
+          p = "/Users/runner/src/modules/backing_track/BUILD.gn"
+          s = open(p).read()
+          import re
+          m = re.search(r'deps = \[(.*?)\]', s, re.S)
+          if m and '//third_party/ffmpeg"' not in m.group(1):
+              s = s.replace(
+                  '"../audio_mixer:audio_mixer_impl",',
+                  '"../audio_mixer:audio_mixer_impl",\n    "//third_party/ffmpeg",'
+              )
+              open(p,"w").write(s)
+              print("backing_track deps 已补 ffmpeg")
+          else:
+              print("backing_track 已有 ffmpeg deps，跳过")
+          PYEOF
+
+          echo "########## sdk framework 挂上 recording ##########"
+          python3 - << 'PYEOF'
+          p = "/Users/runner/src/sdk/BUILD.gn"
+          s = open(p).read()
+          if '//modules/recording:recording' not in s:
+              s = s.replace(
+                  '"//modules/backing_track:backing_track",',
+                  '"//modules/backing_track:backing_track",\n          "//modules/recording:recording",'
+              )
+              open(p,"w").write(s)
+              print("sdk framework 已挂 recording")
+          else:
+              print("sdk 已挂 recording，跳过")
+          PYEOF
+
+      - name: 给 aac/ffmpeg/openh264 补 license 声明
+        run: |
+          python3 - << 'PYEOF'
+          p = "/Users/runner/src/tools_webrtc/libs/generate_licenses.py"
+          s = open(p).read()
+
+          anchor = "LIB_TO_LICENSES_DICT = {"
+          if anchor not in s:
+              print("❌ 未找到 LIB_TO_LICENSES_DICT，结构变了，中止")
+              raise SystemExit(1)
+
+          entries = (
+              "    'aac': ['third_party/aac/fdk-aac/NOTICE'],\n"
+              "    'ffmpeg': ['third_party/ffmpeg/LICENSE.md'],\n"
+              "    'openh264': ['third_party/openh264/src/LICENSE'],\n"
+          )
+
+          if "'aac':" in s and "'ffmpeg':" in s and "'openh264':" in s:
+              print("三个 license 声明已存在，跳过")
+          else:
+              s = s.replace(anchor, anchor + "\n" + entries, 1)
+              open(p, "w").write(s)
+              print("✅ 已补 aac/ffmpeg/openh264 license 声明")
+          PYEOF
+
+      - name: 保证 FFmpeg avconfig.h 存在（macOS x64）
+        run: |
+          FF=/Users/runner/src/third_party/ffmpeg
+          for BRAND in Chromium Chrome; do
+            DSTDIR="$FF/chromium/config/$BRAND/mac/x64/libavutil"
+            [ -d "$FF/chromium/config/$BRAND/mac/x64" ] || continue
+            mkdir -p "$DSTDIR"
+            if [ ! -f "$DSTDIR/avconfig.h" ]; then
+              cat > "$DSTDIR/avconfig.h" << 'EOF'
+          /* Generated for macOS x86_64 */
+          #ifndef AVUTIL_AVCONFIG_H
+          #define AVUTIL_AVCONFIG_H
+          #define AV_HAVE_BIGENDIAN 0
+          #define AV_HAVE_FAST_UNALIGNED 1
+          #endif /* AVUTIL_AVCONFIG_H */
+          EOF
+              echo "已补 $DSTDIR/avconfig.h"
+            else
+              echo "$DSTDIR/avconfig.h 已存在"
+            fi
+          done
+
+      # ============================================================
+      # 编译 macOS x86_64
+      # 注意：WebRTC 官方仓库没有像 tools_webrtc/ios/build_ios_libs.py
+      # 那样现成的 "build_mac_libs.py"，mac 平台一般是直接 gn+ninja
+      # 打 sdk:mac_framework_objc 这个 target 得到 WebRTC.framework。
+      # 如果你们这个 fork 里该 target 名字不一样，运行下面这行能列出来：
+      #   ninja -C out/mac-x64-release -t targets | grep -i framework
+      # 然后把 ninja 编译那行的 target 名换掉即可。
+      # ============================================================
+      - name: 生成 GN 配置并编译
+        run: |
+          export PATH="/opt/homebrew/opt/python@3.11/bin:$HOME/depot_tools:$PATH"
+          export PYTHONPATH="$HOME/depot_tools"
+          cd /Users/runner/src
+
+          gn gen out/mac-x64-release --args='
+            target_os="mac"
+            target_cpu="x64"
+            is_debug=false
+            is_component_build=false
+            rtc_include_tests=false
+            rtc_build_examples=false
+            treat_warnings_as_errors=false
+            is_component_ffmpeg=false
+            use_rtti=true
+          '
+
+          ninja -C out/mac-x64-release sdk:mac_framework_objc
+
+      # ============================================================
+      # 保存编译中间产物缓存
+      # ============================================================
+      - name: 保存编译中间产物缓存
+        if: success() && steps.cache-out.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: /Users/runner/src/out
+          key: out-mac-x64-${{ hashFiles('DEPS', 'sdk/**/*.gn', 'modules/**/*.gn') }}
+
+      - name: 用 xcodebuild 打包成 xcframework 并签名
+        run: |
+          cd /Users/runner/src
+          FRAMEWORK_PATH=$(find out/mac-x64-release -maxdepth 2 -name "WebRTC.framework" -print -quit)
+          if [ -z "$FRAMEWORK_PATH" ]; then
+            echo "❌ 没找到 WebRTC.framework，检查上一步 ninja target 名是否正确"
+            find out/mac-x64-release -maxdepth 3 -iname "*.framework"
+            exit 1
+          fi
+          echo "找到 framework: $FRAMEWORK_PATH"
+
+          rm -rf $GITHUB_WORKSPACE/WebRTC-macOS.xcframework
+          xcodebuild -create-xcframework \
+            -framework "$FRAMEWORK_PATH" \
+            -output $GITHUB_WORKSPACE/WebRTC-macOS.xcframework
+
+          codesign --sign - --force --deep $GITHUB_WORKSPACE/WebRTC-macOS.xcframework
+          echo "✅ 打包并签名完成"
+          codesign -dv $GITHUB_WORKSPACE/WebRTC-macOS.xcframework
+
+      # ============================================================
+      # 打包 + 计算 checksum（SPM 需要）
+      # ============================================================
+      - name: 打包成 zip 并计算 checksum
+        id: package
+        run: |
+          cd $GITHUB_WORKSPACE
+          zip -ry WebRTC-macOS.xcframework.zip WebRTC-macOS.xcframework
+
+          CHECKSUM=$(swift package compute-checksum WebRTC-macOS.xcframework.zip)
+          echo "checksum=$CHECKSUM" >> $GITHUB_OUTPUT
+          echo "✅ Checksum: $CHECKSUM"
+
+      # ============================================================
+      # 仅在打 macos-v*.*.* tag 时发布 GitHub Release
+      # 用独立文件名，不会覆盖 iOS 那份 Release 资产
+      # ============================================================
+      - name: 发布到 GitHub Release（打 tag 时）
+        if: startsWith(github.ref, 'refs/tags/macos-v')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          body: |
+            ## WebRTC macOS x86_64 XCFramework ${{ github.ref_name }}
+
+            原生 macOS Intel (x86_64) 库，通过 Swift Package Manager 使用：
+            ```swift
+            .binaryTarget(
+                name: "WebRTC-macOS",
+                url: "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/WebRTC-macOS.xcframework.zip",
+                checksum: "${{ steps.package.outputs.checksum }}"
+            )
+            ```
+          files: ${{ github.workspace }}/WebRTC-macOS.xcframework.zip
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # 手动触发时只上传 Artifact
+      - name: 上传为 Artifact（手动触发时）
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: WebRTC-macOS-x86_64-XCFramework
+          path: WebRTC-macOS.xcframework.zip
+          retention-days: 30
