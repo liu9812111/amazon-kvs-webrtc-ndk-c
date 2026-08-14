@@ -342,6 +342,16 @@ jobs:
               "libswresample/swresample_frame.c",
               "libswresample/version.c",
           ]
+          # resample_dsp.c 内部会调用 swri_resample_dsp_x86_init()，这个调用是被
+          # ARCH_X86（"当前是不是 x86 架构"）保护的，不受我们关掉的 HAVE_MMX/
+          # HAVE_SSE 这些"有没有 SIMD 能力"宏影响——ARCH_X86 该是 1 就是 1，
+          # 不能关。所以必须把定义这个函数的 x86 初始化文件也编进来，不然
+          # 只有调用没有定义，链接时报 undefined symbol。因为 HAVE_MMX/SSE
+          # 已经是 0 了，这个文件内部实际上不会走到任何真正的汇编分支，
+          # 相当于一个安全的空壳初始化函数。
+          x86_only_srcs = [
+              "libswresample/x86/resample_dsp_init.c",
+          ]
           # 这两组是 NEON 汇编，仅在 current_cpu == "arm64" 时才会被条件编译进去，
           # x64 模拟器构建时这个 if 分支不会生效，但保留写入不影响、也方便以后
           # 和 device 版共用同一份 gni patch 逻辑。
@@ -368,6 +378,7 @@ jobs:
 
           base_wrappers = [make_wrapper(r) for r in base_srcs]
           arm_wrappers = [make_wrapper(r) for r in arm_srcs]
+          x86_wrappers = [make_wrapper(r) for r in x86_only_srcs]
 
           lines = []
           lines.append("")
@@ -376,6 +387,12 @@ jobs:
           for w in base_wrappers:
               lines.append('  "%s",' % w)
           lines.append("]")
+          lines.append('if (current_cpu == "x64" || current_cpu == "x86") {')
+          lines.append("  ffmpeg_c_sources += [")
+          for w in x86_wrappers:
+              lines.append('    "%s",' % w)
+          lines.append("  ]")
+          lines.append("}")
           lines.append('if ((is_mac || is_ios) && current_cpu == "arm64") {')
           lines.append("  ffmpeg_c_sources += [")
           for w in arm_wrappers:
@@ -397,6 +414,8 @@ jobs:
               print("❌ gni 未发生替换，中止"); sys.exit(1)
           if "autorename_libswresample_swresample.c" not in open(p).read():
               print("❌ swresample 包装未写入，中止"); sys.exit(1)
+          if "autorename_libswresample_x86_resample_dsp_init.c" not in open(p).read():
+              print("❌ x86 resample_dsp_init 包装未写入，中止"); sys.exit(1)
           if not os.path.exists(os.path.join(ff, "autorename_libswresample_options.c")):
               print("❌ 包装文件未生成，中止"); sys.exit(1)
           if "audio_convert_neon.S" not in open(p).read():
