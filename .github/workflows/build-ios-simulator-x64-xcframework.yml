@@ -259,24 +259,46 @@ jobs:
       # 宏，让通用代码走无 SIMD 的 fallback 路径——模拟器构建本来也不需要
       # 这点 x86 SIMD 加速。
       # ============================================================
-      - name: 禁用 ios/x64 的 x86 汇编优化（HAVE_X86ASM / HAVE_YASM）
+      - name: 禁用 ios/x64 的 x86 汇编优化（全部 x86 CPU 特性宏）
         run: |
           FF=/Users/runner/src/third_party/ffmpeg
           for BRAND in Chromium Chrome; do
             CH="$FF/chromium/config/$BRAND/ios/x64/config.h"
             [ -f "$CH" ] || continue
-            echo "==== 处理前 $CH 里的相关宏 ===="
-            grep -n "HAVE_X86ASM\|HAVE_YASM\|HAVE_INLINE_ASM" "$CH" || echo "（没找到，可能这几个宏名字不对，需要人工看一下 config.h 实际内容）"
-            echo "---- 保险起见，把所有和 asm/mmx/sse/avx 相关的宏都打印出来，方便万一上面没命中时排查 ----"
-            grep -n "^#define HAVE_" "$CH" | grep -iE "asm|mmx|sse|avx|3dnow" || true
 
-            sed -i '' \
-              -e 's/#define HAVE_X86ASM 1/#define HAVE_X86ASM 0/' \
-              -e 's/#define HAVE_YASM 1/#define HAVE_YASM 0/' \
-              "$CH"
+            echo "==== 处理前，所有和 asm/mmx/sse/avx/3dnow 相关且值为 1 的宏 ===="
+            grep -n "^#define HAVE_" "$CH" | grep -iE "asm|mmx|sse|avx|3dnow|fma|xop" || echo "（一个都没匹配到，说明宏名和我预期的完全不一样，需要贴出 config.h 全文排查）"
 
-            echo "==== 处理后确认 ===="
-            grep -n "HAVE_X86ASM\|HAVE_YASM" "$CH" || true
+            # 之前只关了 HAVE_X86ASM/HAVE_YASM 这两个总开关，不够——
+            # hpeldsp_init.c 这类文件是靠 HAVE_MMX/HAVE_MMXEXT/HAVE_SSE.. 这些
+            # 更细粒度的 CPU 特性宏在"内联汇编"和"外部汇编"两条代码路径间切换的，
+            # 只关总开关会导致声明和实现的命名规则对不上（undeclared identifier）。
+            # 这里把所有相关的 HAVE_* 宏统一置 0，让 ffmpeg 老老实实走无 SIMD
+            # 的通用 C 实现，不再有任何路径去引用汇编符号。
+            python3 - "$CH" << 'PYEOF'
+import re, sys
+path = sys.argv[1]
+s = open(path).read()
+
+# 匹配所有 "#define HAVE_XXX 1" 且 XXX 里包含这些关键字之一的行，统一改成 0
+pattern = re.compile(
+    r'^(#define HAVE_\w*(?:ASM|YASM|MMX|SSE|AVX|3DNOW|FMA\d?|XOP|AESNI|VFP|NEON)\w*)\s+1\s*$',
+    re.MULTILINE | re.IGNORECASE,
+)
+
+count = 0
+def repl(m):
+    global count
+    count += 1
+    return m.group(1) + " 0"
+
+s2 = pattern.sub(repl, s)
+open(path, "w").write(s2)
+print(f"共关闭 {count} 个 x86 CPU 特性宏")
+PYEOF
+
+            echo "==== 处理后确认（应该全是 0，或者干脆搜不到）===="
+            grep -n "^#define HAVE_" "$CH" | grep -iE "asm|mmx|sse|avx|3dnow|fma|xop" || echo "（全部关闭/未匹配到）"
           done
 
       - name: Patch BUILD.gn（去 lrt + 补 ffmpeg deps + 挂 recording）
