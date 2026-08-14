@@ -249,6 +249,36 @@ jobs:
             && echo "✅ avconfig.h OK" \
             || echo "⚠️ 无 avconfig.h（下一步会单独保证）"
 
+      # ============================================================
+      # 禁用 x86 汇编优化：拷贝来的 mac/x64 config.h 里 HAVE_X86ASM/
+      # HAVE_YASM 是开着的，导致 videodsp_init.c 等通用代码去调用只在
+      # nasm 汇编里实现的符号（ff_prefetch_mmxext 等）。这些符号所在的
+      # 静态库编是编出来了，但 GN 依赖传播链在这个 fork 的结构下没能把
+      # 它正确带进最终 -all_load 链接（undefined symbol: ff_prefetch_mmxext
+      # 之类的报错）。与其继续深挖 GN 依赖传播哪里断了，不如直接关掉这个
+      # 宏，让通用代码走无 SIMD 的 fallback 路径——模拟器构建本来也不需要
+      # 这点 x86 SIMD 加速。
+      # ============================================================
+      - name: 禁用 ios/x64 的 x86 汇编优化（HAVE_X86ASM / HAVE_YASM）
+        run: |
+          FF=/Users/runner/src/third_party/ffmpeg
+          for BRAND in Chromium Chrome; do
+            CH="$FF/chromium/config/$BRAND/ios/x64/config.h"
+            [ -f "$CH" ] || continue
+            echo "==== 处理前 $CH 里的相关宏 ===="
+            grep -n "HAVE_X86ASM\|HAVE_YASM\|HAVE_INLINE_ASM" "$CH" || echo "（没找到，可能这几个宏名字不对，需要人工看一下 config.h 实际内容）"
+            echo "---- 保险起见，把所有和 asm/mmx/sse/avx 相关的宏都打印出来，方便万一上面没命中时排查 ----"
+            grep -n "^#define HAVE_" "$CH" | grep -iE "asm|mmx|sse|avx|3dnow" || true
+
+            sed -i '' \
+              -e 's/#define HAVE_X86ASM 1/#define HAVE_X86ASM 0/' \
+              -e 's/#define HAVE_YASM 1/#define HAVE_YASM 0/' \
+              "$CH"
+
+            echo "==== 处理后确认 ===="
+            grep -n "HAVE_X86ASM\|HAVE_YASM" "$CH" || true
+          done
+
       - name: Patch BUILD.gn（去 lrt + 补 ffmpeg deps + 挂 recording）
         run: |
           SRC=/Users/runner/src
@@ -264,15 +294,19 @@ jobs:
           p = os.path.join(ff, "ffmpeg_generated.gni")
           s = open(p).read()
 
-          # 注意：这里不再做 "is_mac -> (is_mac || is_ios)" 的全文替换。
-          # ffmpeg_generated.gni 里所有 is_mac 都是跟 current_cpu 配对出现的
-          # （VP8/H264 intra-pred 这类 x86 SIMD 优化源码块），跟我们需要的
-          # swresample/audio_fifo 完全无关（那部分靠下面手动 wrapper 无条件
-          # 加）。之前给 device:arm64 编译时这个替换是无害空操作（current_cpu
-          # 对不上），但给 x64 模拟器编译时会把 VP8 的 x86 asm 源文件一起拉进
-          # iOS 构建，触发 nasm 静态库未正确链接进最终产物的 bug
-          # （undefined symbol: ff_prefetch_mmxext 等）。直接跳过这步。
-          s2 = s
+          # 重要澄清（之前一度删掉这段正则是判断错了）：
+          # ffmpeg_generated.gni 用 is_mac || is_win || use_linux_config 这套
+          # 条件分配源文件，完全没有 iOS 分支。不加这段替换，iOS/模拟器下
+          # ffmpeg_c_sources 会是空的——不止缺 swresample，是整个
+          # avcodec/avformat/avutil 都编不出来（这是 device:arm64 版调试时
+          # 已经确认过的根因）。所以这段替换是必须的，不能删。
+          # x64 模拟器上真正的坑是另一个：is_mac||is_ios 且 current_cpu=="x64"
+          # 这个组合会顺带把 videodsp/vp8dsp 这类 x86 SIMD 优化源码也拉进来，
+          # 触发一个 nasm 静态库没被正确链进最终 framework 的问题。这部分靠
+          # 下面单独一步把 HAVE_X86ASM/HAVE_YASM 关掉来压制，而不是靠不做
+          # 这段替换（不做的话整个 ffmpeg 都编不出来，问题更大）。
+          before = s.count("is_ios")
+          s2 = re.sub(r'\bis_mac\b', '(is_mac || is_ios)', s)
 
           base_srcs = [
               "libavutil/audio_fifo.c",
@@ -336,6 +370,9 @@ jobs:
           s2 = s2 + extra
           open(p, "w").write(s2)
 
+          after_ios = open(p).read().count("is_ios")
+          if after_ios <= before:
+              print("❌ gni 未发生替换，中止"); sys.exit(1)
           if "autorename_libswresample_swresample.c" not in open(p).read():
               print("❌ swresample 包装未写入，中止"); sys.exit(1)
           if not os.path.exists(os.path.join(ff, "autorename_libswresample_options.c")):
