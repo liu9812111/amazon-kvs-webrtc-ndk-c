@@ -350,14 +350,20 @@ jobs:
               "libswresample/swresample_frame.c",
               "libswresample/version.c",
           ]
-          # 之前以为需要补 libswresample/x86/resample_dsp_init.c 这个文件，
-          # 后来直接查了 FFmpeg 官方源码确认：resample_dsp.c 里这行调用是
-          #   #if ARCH_X86 && HAVE_X86ASM
-          #       swri_resample_dsp_x86_init(c);
-          #   #endif
-          # 完全由 HAVE_X86ASM 控制，官方源码里也根本没有这个文件（编译时
-          # "file not found" 报错证实了这点）。真正要做的是确保 HAVE_X86ASM
-          # 被正确改成 0，而不是去补一个不存在的文件——不需要 x86_only_srcs。
+          # resample_dsp.c 里调用 swri_resample_dsp_x86_init(c)，即使
+          # HAVE_X86ASM 已经确认改成了 0，这个符号在这个 fork 里还是
+          # undefined——说明这个 fork 版本的判断条件跟官方 FFmpeg 上游不
+          # 完全一样（可能压根没有 HAVE_X86ASM 这层门槛，只要是 x86 架构
+          # 就无条件调用）。与其继续猜条件到底长什么样，不如直接给这个
+          # 符号提供一个空实现，绕开条件判断本身——反正 HAVE_MMX/SSE 已经
+          # 是 0 了，语义上"什么都不做"就是正确行为。
+          # 函数签名来自官方 resample.h: void swri_resample_dsp_x86_init(ResampleContext *c);
+          x86_stub_path = os.path.join(ff, "autorename_libswresample_x86_stub_init.c")
+          with open(x86_stub_path, "w") as w:
+              w.write(
+                  '#include "libswresample/resample.h"\n'
+                  'void swri_resample_dsp_x86_init(ResampleContext *c) { (void)c; }\n'
+              )
           # 这两组是 NEON 汇编，仅在 current_cpu == "arm64" 时才会被条件编译进去，
           # x64 模拟器构建时这个 if 分支不会生效，但保留写入不影响、也方便以后
           # 和 device 版共用同一份 gni patch 逻辑。
@@ -392,6 +398,11 @@ jobs:
           for w in base_wrappers:
               lines.append('  "%s",' % w)
           lines.append("]")
+          lines.append('if (current_cpu == "x64" || current_cpu == "x86") {')
+          lines.append("  ffmpeg_c_sources += [")
+          lines.append('    "autorename_libswresample_x86_stub_init.c",')
+          lines.append("  ]")
+          lines.append("}")
           lines.append('if ((is_mac || is_ios) && current_cpu == "arm64") {')
           lines.append("  ffmpeg_c_sources += [")
           for w in arm_wrappers:
@@ -413,6 +424,8 @@ jobs:
               print("❌ gni 未发生替换，中止"); sys.exit(1)
           if "autorename_libswresample_swresample.c" not in open(p).read():
               print("❌ swresample 包装未写入，中止"); sys.exit(1)
+          if "autorename_libswresample_x86_stub_init.c" not in open(p).read():
+              print("❌ x86 stub 包装未写入，中止"); sys.exit(1)
           if not os.path.exists(os.path.join(ff, "autorename_libswresample_options.c")):
               print("❌ 包装文件未生成，中止"); sys.exit(1)
           if "audio_convert_neon.S" not in open(p).read():
