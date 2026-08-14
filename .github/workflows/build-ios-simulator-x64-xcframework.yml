@@ -276,26 +276,26 @@ jobs:
             # 这里把所有相关的 HAVE_* 宏统一置 0，让 ffmpeg 老老实实走无 SIMD
             # 的通用 C 实现，不再有任何路径去引用汇编符号。
             python3 - "$CH" << 'PYEOF'
-import re, sys
-path = sys.argv[1]
-s = open(path).read()
+          import re, sys
+          path = sys.argv[1]
+          s = open(path).read()
 
-# 匹配所有 "#define HAVE_XXX 1" 且 XXX 里包含这些关键字之一的行，统一改成 0
-pattern = re.compile(
-    r'^(#define HAVE_\w*(?:ASM|YASM|MMX|SSE|AVX|3DNOW|FMA\d?|XOP|AESNI|VFP|NEON)\w*)\s+1\s*$',
-    re.MULTILINE | re.IGNORECASE,
-)
+          # 匹配所有 "#define HAVE_XXX 1" 且 XXX 里包含这些关键字之一的行，统一改成 0
+          pattern = re.compile(
+              r'^(#define HAVE_\w*(?:ASM|YASM|MMX|SSE|AVX|3DNOW|FMA\d?|XOP|AESNI|VFP|NEON)\w*)\s+1\s*$',
+              re.MULTILINE | re.IGNORECASE,
+          )
 
-count = 0
-def repl(m):
-    global count
-    count += 1
-    return m.group(1) + " 0"
+          count = 0
+          def repl(m):
+              global count
+              count += 1
+              return m.group(1) + " 0"
 
-s2 = pattern.sub(repl, s)
-open(path, "w").write(s2)
-print(f"共关闭 {count} 个 x86 CPU 特性宏")
-PYEOF
+          s2 = pattern.sub(repl, s)
+          open(path, "w").write(s2)
+          print(f"共关闭 {count} 个 x86 CPU 特性宏")
+          PYEOF
 
             echo "==== 处理后确认（应该全是 0，或者干脆搜不到）===="
             grep -n "^#define HAVE_" "$CH" | grep -iE "asm|mmx|sse|avx|3dnow|fma|xop" || echo "（全部关闭/未匹配到）"
