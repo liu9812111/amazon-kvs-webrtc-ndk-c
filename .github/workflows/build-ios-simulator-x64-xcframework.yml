@@ -115,6 +115,23 @@ jobs:
           key: out-ios-simx64-${{ hashFiles('DEPS', 'sdk/**/*.gn', 'modules/**/*.gn') }}
           restore-keys: out-ios-simx64-
 
+      # ============================================================
+      # 防止缓存污染：gclient 依赖缓存的保存步骤用了 always()，哪怕上次
+      # 编译最终失败也会把已经被 patch 过的 third_party/ffmpeg 存进缓存。
+      # 这里强制把 third_party/ffmpeg 重置回 gclient 同步下来的干净状态，
+      # 避免上一次失败运行残留的补丁（比如已经被写脏的 ffmpeg_generated.gni）
+      # 通过缓存命中的方式再次带进来，导致同样的错误反复出现。
+      # ============================================================
+      - name: 重置 third_party/ffmpeg 到干净状态
+        run: |
+          cd /Users/runner/src/third_party/ffmpeg
+          echo "---- 重置前 git status ----"
+          git status --porcelain | head -50
+          git checkout -- . 2>&1 || echo "（git checkout 失败，可能不是 git 仓库，忽略）"
+          git clean -fdx -- . 2>&1 | head -50 || true
+          echo "---- 重置后确认 ffmpeg_generated.gni 干净 ----"
+          grep -c "is_mac || is_ios" ffmpeg_generated.gni || echo "0（干净，符合预期）"
+
       # ---- 以下 patch 步骤和 device 版基本一致，只有 arm64 -> x64 的路径改动 ----
 
       - name: 部署 third_party/aac 并生成正确的 BUILD.gn
