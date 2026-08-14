@@ -246,8 +246,16 @@ jobs:
           ff = "/Users/runner/src/third_party/ffmpeg"
           p = os.path.join(ff, "ffmpeg_generated.gni")
           s = open(p).read()
-          before = s.count("is_ios")
-          s2 = re.sub(r'\bis_mac\b', '(is_mac || is_ios)', s)
+
+          # 注意：这里不再做 "is_mac -> (is_mac || is_ios)" 的全文替换。
+          # ffmpeg_generated.gni 里所有 is_mac 都是跟 current_cpu 配对出现的
+          # （VP8/H264 intra-pred 这类 x86 SIMD 优化源码块），跟我们需要的
+          # swresample/audio_fifo 完全无关（那部分靠下面手动 wrapper 无条件
+          # 加）。之前给 device:arm64 编译时这个替换是无害空操作（current_cpu
+          # 对不上），但给 x64 模拟器编译时会把 VP8 的 x86 asm 源文件一起拉进
+          # iOS 构建，触发 nasm 静态库未正确链接进最终产物的 bug
+          # （undefined symbol: ff_prefetch_mmxext 等）。直接跳过这步。
+          s2 = s
 
           base_srcs = [
               "libavutil/audio_fifo.c",
@@ -311,9 +319,6 @@ jobs:
           s2 = s2 + extra
           open(p, "w").write(s2)
 
-          after_ios = open(p).read().count("is_ios")
-          if after_ios <= before:
-              print("❌ gni 未发生替换，中止"); sys.exit(1)
           if "autorename_libswresample_swresample.c" not in open(p).read():
               print("❌ swresample 包装未写入，中止"); sys.exit(1)
           if not os.path.exists(os.path.join(ff, "autorename_libswresample_options.c")):
