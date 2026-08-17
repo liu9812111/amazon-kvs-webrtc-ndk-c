@@ -1,0 +1,684 @@
+name: Build iOS Simulator Universal (arm64+x86_64) XCFramework
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'ios-sim-universal-v*.*.*'   # 独立 tag 前缀，避免和 device 版 v*.*.* / macOS 版 macos-v*.*.* / 单独x64版 ios-sim-v*.*.* 冲突
+
+jobs:
+  build-ios-sim-universal:
+    runs-on: macos-14
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          ref: add-aac-softcodec-mp4recording
+          fetch-depth: 1
+
+      - name: 安装 Python 3.11 和 setuptools
+        run: |
+          brew install python@3.11
+          /opt/homebrew/opt/python@3.11/bin/python3.11 -m pip install setuptools --break-system-packages
+
+      - name: 安装 depot_tools
+        run: |
+          git clone --depth=1 https://chromium.googlesource.com/chromium/tools/depot_tools.git $HOME/depot_tools
+          echo "$HOME/depot_tools" >> $GITHUB_PATH
+
+      - name: 写入 gclient 配置
+        run: |
+          cd $HOME
+          cat > .gclient << 'GCLIENT_EOF'
+          solutions = [
+            {
+              "name": "src",
+              "url": "https://github.com/liu9812111/amazon-kvs-webrtc-ndk-c.git@add-aac-softcodec-mp4recording",
+              "deps_file": "DEPS",
+              "managed": False,
+              "custom_vars": {},
+            },
+          ]
+          target_os = ["ios"]
+          GCLIENT_EOF
+
+      # ============================================================
+      # 缓存层 1：gclient 依赖（third_party）
+      # 和 device 版共用同一个 key，反正依赖内容跟 arch 无关
+      # ============================================================
+      - name: 恢复 gclient 依赖缓存
+        id: cache-gclient
+        uses: actions/cache/restore@v4
+        with:
+          path: /Users/runner/src/third_party
+          key: gclient-ios-${{ hashFiles('DEPS') }}
+          restore-keys: gclient-ios-
+
+      - name: 同步依赖并修复后执行 hooks
+        run: |
+          cd $HOME
+          gclient sync --no-history --shallow --nohooks
+          python3 -c "
+          path = '/Users/runner/src/build/mac_toolchain.py'
+          with open(path) as f:
+              content = f.read()
+          if 'except ImportError' not in content:
+              content = content.replace(
+                  'import pkg_resources',
+                  'try:\n    import pkg_resources\nexcept ImportError:\n    pkg_resources = None'
+              )
+              with open(path, 'w') as f:
+                  f.write(content)
+              print('mac_toolchain.py 修复完成')
+          else:
+              print('mac_toolchain.py 已修复过，跳过')
+          "
+          gclient runhooks
+
+      - name: 保存 gclient 依赖缓存
+        if: always() && steps.cache-gclient.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: /Users/runner/src/third_party
+          key: gclient-ios-${{ hashFiles('DEPS') }}
+
+      - name: 升级 clang 工具链（兼容 Xcode 15 SDK）
+        run: |
+          cd /Users/runner/src
+          echo "当前 clang 版本："
+          third_party/llvm-build/Release+Asserts/bin/clang --version || true
+
+          curl -fsSL "https://chromium.googlesource.com/chromium/src/+/refs/branch-heads/5993/tools/clang/scripts/update.py?format=TEXT" \
+            | python3 -c "import base64,sys;sys.stdout.buffer.write(base64.b64decode(sys.stdin.read()))" \
+            > /tmp/clang_update.py
+
+          rm -rf third_party/llvm-build
+          python3.11 /tmp/clang_update.py --output-dir third_party/llvm-build/Release+Asserts
+
+          cp /tmp/clang_update.py tools/clang/scripts/update.py
+          sed -i '' -E 's/clang_version = "16[0-9.]*"/clang_version = "17"/' build/toolchain/toolchain.gni
+          echo "---- toolchain.gni 中的 clang_version ----"
+          grep -n 'clang_version' build/toolchain/toolchain.gni || true
+
+          echo "替换后 clang 版本："
+          third_party/llvm-build/Release+Asserts/bin/clang --version
+
+      # ============================================================
+      # 缓存层 2：编译中间产物（out/ 目录）
+      # 用独立 key，跟 device:arm64 版的 out-ios- 分开，避免互相覆盖
+      # ============================================================
+      - name: 恢复编译中间产物缓存
+        id: cache-out
+        uses: actions/cache/restore@v4
+        with:
+          path: /Users/runner/src/out
+          key: out-ios-simuniversal-${{ hashFiles('DEPS', 'sdk/**/*.gn', 'modules/**/*.gn') }}
+          restore-keys: out-ios-simuniversal-
+
+      # ============================================================
+      # 防止缓存污染：gclient 依赖缓存的保存步骤用了 always()，哪怕上次
+      # 编译最终失败也会把已经被 patch 过的 third_party/ffmpeg 存进缓存。
+      # 这里强制把 third_party/ffmpeg 重置回 gclient 同步下来的干净状态，
+      # 避免上一次失败运行残留的补丁（比如已经被写脏的 ffmpeg_generated.gni）
+      # 通过缓存命中的方式再次带进来，导致同样的错误反复出现。
+      # ============================================================
+      - name: 重置 third_party/ffmpeg 到干净状态
+        run: |
+          cd /Users/runner/src/third_party/ffmpeg
+          echo "---- 重置前 git status ----"
+          git status --porcelain | head -50
+          git checkout -- . 2>&1 || echo "（git checkout 失败，可能不是 git 仓库，忽略）"
+          git clean -fdx -- . 2>&1 | head -50 || true
+          echo "---- 重置后确认 ffmpeg_generated.gni 干净 ----"
+          grep -c "is_mac || is_ios" ffmpeg_generated.gni || echo "0（干净，符合预期）"
+
+      # ---- 以下 patch 步骤和 device 版基本一致，同时覆盖 arm64 + x64 两个架构 ----
+
+      - name: 部署 third_party/aac 并生成正确的 BUILD.gn
+        run: |
+          AAC_SRC="$GITHUB_WORKSPACE/third_party/aac"
+          AAC_DST="/Users/runner/src/third_party/aac"
+
+          rm -rf "$AAC_DST"
+          mkdir -p "$AAC_DST"
+
+          if [ ! -d "$AAC_SRC/fdk-aac" ]; then
+            git clone --depth=1 https://github.com/mstorsjo/fdk-aac.git "$AAC_DST/fdk-aac"
+            rm -rf "$AAC_DST/fdk-aac/.git"
+          else
+            cp -R "$AAC_SRC/." "$AAC_DST/"
+          fi
+
+          echo "---- fdk-aac 目录结构（2层）----"
+          find "$AAC_DST/fdk-aac" -maxdepth 2 -type d | sort
+
+          python3 - "$AAC_DST" << 'PYEOF'
+          import os, sys
+
+          aac_dst = sys.argv[1]
+          fdk_root = os.path.join(aac_dst, "fdk-aac")
+
+          excluded_dirs = {"arm", "win32", "x86", "fuzzer", "mips", "aarch64", "tests", "benchmark"}
+          sources = []
+          for dirpath, dirnames, filenames in os.walk(fdk_root):
+              path_parts = set(os.path.relpath(dirpath, aac_dst).split(os.sep))
+              if path_parts & excluded_dirs:
+                  continue
+              for fname in sorted(filenames):
+                  if fname.endswith(".cpp"):
+                      rel = os.path.relpath(os.path.join(dirpath, fname), aac_dst)
+                      sources.append(rel)
+          sources.sort()
+          print(f"收集到 {len(sources)} 个 .cpp 文件")
+
+          include_dirs = ["fdk-aac", "."]
+          for entry in sorted(os.listdir(fdk_root)):
+              inc = os.path.join(fdk_root, entry, "include")
+              if os.path.isdir(inc):
+                  include_dirs.append(f"fdk-aac/{entry}/include")
+
+          sources_str = "\n".join(f'    "{s}",' for s in sources)
+          include_str = "\n".join(f'    "{d}",' for d in include_dirs)
+
+          build_gn = f'''config("aac_includes") {{
+            include_dirs = [
+          {include_str}
+            ]
+          }}
+
+          static_library("aac") {{
+            sources = [
+          {sources_str}
+            ]
+            defines = [ "SUPPRESS_BUILD_DATE_INFO" ]
+            public_configs = [ ":aac_includes" ]
+            configs -= [ "//build/config/compiler:chromium_code" ]
+            configs += [ "//build/config/compiler:no_chromium_code" ]
+            cflags = [ "-w" ]
+            cflags_cc = [ "-w" ]
+          }}
+
+          group("aac_3p") {{
+            public_deps = [ ":aac" ]
+          }}
+
+          group("rtc_aac") {{
+            public_deps = [ ":aac" ]
+          }}
+          '''
+
+          out_path = os.path.join(aac_dst, "BUILD.gn")
+          with open(out_path, "w") as f:
+              f.write(build_gn)
+          print(f"BUILD.gn 已写入: {out_path}")
+          PYEOF
+
+          echo "---- 确认 target 名 ----"
+          grep -n 'static_library\|group' "$AAC_DST/BUILD.gn"
+
+      # ============================================================
+      # iOS 官方没有原生 ios/arm64 和 ios/x64 的 ffmpeg config（WebRTC
+      # 只给 mac 平台原生生成过 config），分别复用 mac/arm64（device 版
+      # 用的那套）和 mac/x64（模拟器 x64 用的那套）拷贝过去。因为要出
+      # 通用库，两个架构的 config 都要生成。
+      # ============================================================
+      - name: 生成 ffmpeg iOS config（复用 mac/arm64 + mac/x64）
+        run: |
+          FF=/Users/runner/src/third_party/ffmpeg
+          CFG_ROOT="$FF/chromium/config"
+
+          for BRAND in Chromium Chrome; do
+            for CPU in arm64 x64; do
+              SRC="$CFG_ROOT/$BRAND/mac/$CPU"
+              DST="$CFG_ROOT/$BRAND/ios/$CPU"
+              if [ -d "$SRC" ]; then
+                echo "==== 复用 $BRAND/mac/$CPU -> $BRAND/ios/$CPU ===="
+                rm -rf "$DST"
+                mkdir -p "$DST"
+                ( cd "$SRC" && tar cf - . ) | ( cd "$DST" && tar xf - )
+                echo "已生成: $DST"
+                ls -la "$DST"
+              else
+                echo "（$BRAND 无 mac/$CPU，跳过）"
+              fi
+            done
+          done
+
+          echo "---- 校验 ios/arm64 和 ios/x64 的 config.h 都存在 ----"
+          for CPU in arm64 x64; do
+            test -f "$CFG_ROOT/Chromium/ios/$CPU/config.h" \
+              && echo "✅ Chromium/ios/$CPU/config.h OK" \
+              || { echo "❌ 缺 ios/$CPU/config.h"; exit 1; }
+            test -f "$CFG_ROOT/Chromium/ios/$CPU/libavutil/avconfig.h" \
+              && echo "✅ ios/$CPU avconfig.h OK" \
+              || echo "⚠️ ios/$CPU 无 avconfig.h（下一步会单独保证）"
+          done
+
+      # ============================================================
+      # 禁用 x86 汇编优化：拷贝来的 mac/x64 config.h 里 HAVE_X86ASM/
+      # HAVE_YASM 是开着的，导致 videodsp_init.c 等通用代码去调用只在
+      # nasm 汇编里实现的符号（ff_prefetch_mmxext 等）。这些符号所在的
+      # 静态库编是编出来了，但 GN 依赖传播链在这个 fork 的结构下没能把
+      # 它正确带进最终 -all_load 链接（undefined symbol: ff_prefetch_mmxext
+      # 之类的报错）。与其继续深挖 GN 依赖传播哪里断了，不如直接关掉这个
+      # 宏，让通用代码走无 SIMD 的 fallback 路径——模拟器构建本来也不需要
+      # 这点 x86 SIMD 加速。
+      # ============================================================
+      - name: 禁用 ios/x64 的 x86 汇编优化（全部 x86 CPU 特性宏，只影响 x64，arm64 不需要）
+        run: |
+          FF=/Users/runner/src/third_party/ffmpeg
+          for BRAND in Chromium Chrome; do
+            CH="$FF/chromium/config/$BRAND/ios/x64/config.h"
+            [ -f "$CH" ] || continue
+
+            echo "==== 处理前，所有和 asm/mmx/sse/avx/3dnow 相关且值为 1 的宏 ===="
+            grep -n "^#define HAVE_" "$CH" | grep -iE "asm|mmx|sse|avx|3dnow|fma|xop" || echo "（一个都没匹配到，说明宏名和我预期的完全不一样，需要贴出 config.h 全文排查）"
+
+            # 之前只关了 HAVE_X86ASM/HAVE_YASM 这两个总开关，不够——
+            # hpeldsp_init.c 这类文件是靠 HAVE_MMX/HAVE_MMXEXT/HAVE_SSE.. 这些
+            # 更细粒度的 CPU 特性宏在"内联汇编"和"外部汇编"两条代码路径间切换的，
+            # 只关总开关会导致声明和实现的命名规则对不上（undeclared identifier）。
+            # 这里把所有相关的 HAVE_* 宏统一置 0，让 ffmpeg 老老实实走无 SIMD
+            # 的通用 C 实现，不再有任何路径去引用汇编符号。
+            python3 - "$CH" << 'PYEOF'
+          import re, sys
+          path = sys.argv[1]
+          s = open(path).read()
+
+          # 注意：不要求匹配到行尾（原来的 \s+1\s*$ 太严格，如果这一行后面
+          # 带注释或者其他字符就匹配不上，之前 HAVE_X86ASM 没被真正改成 0
+          # 大概率就是栽在这里）。改成只匹配 "宏名 + 空白 + 1" 这个片段本身，
+          # 不管它后面跟着什么。
+          pattern = re.compile(
+              r'(#define\s+HAVE_\w*(?:ASM|YASM|MMX|SSE|AVX|3DNOW|FMA\d?|XOP|AESNI|VFP|NEON)\w*\s+)1\b',
+              re.IGNORECASE,
+          )
+
+          count = 0
+          def repl(m):
+              global count
+              count += 1
+              return m.group(1) + "0"
+
+          s2 = pattern.sub(repl, s)
+          open(path, "w").write(s2)
+          print(f"共关闭 {count} 个 x86 CPU 特性宏")
+
+          # 专门再确认一次 HAVE_X86ASM 本身的最终值，这是这次报错的关键
+          for line in s2.splitlines():
+              if "HAVE_X86ASM" in line or "HAVE_YASM" in line:
+                  print("关键确认:", line)
+          PYEOF
+
+            echo "==== 处理后确认（应该全是 0，或者干脆搜不到）===="
+            grep -n "^#define HAVE_" "$CH" | grep -iE "asm|mmx|sse|avx|3dnow|fma|xop" || echo "（全部关闭/未匹配到）"
+          done
+
+      - name: Patch BUILD.gn（去 lrt + 补 ffmpeg deps + 挂 recording）
+        run: |
+          SRC=/Users/runner/src
+          FF=$SRC/third_party/ffmpeg
+
+          echo "########## 修复2a-0 ##########"
+          echo "---- 确认 aarch64 实际文件名（这次是通用库，arm64 汇编真的会被用到）----"
+          ls -1 "$FF/libswresample/aarch64/" || echo "（无 aarch64 目录）"
+
+          python3 - << 'PYEOF'
+          import sys, re, os
+          ff = "/Users/runner/src/third_party/ffmpeg"
+          p = os.path.join(ff, "ffmpeg_generated.gni")
+          s = open(p).read()
+
+          # 重要澄清（之前一度删掉这段正则是判断错了）：
+          # ffmpeg_generated.gni 用 is_mac || is_win || use_linux_config 这套
+          # 条件分配源文件，完全没有 iOS 分支。不加这段替换，iOS/模拟器下
+          # ffmpeg_c_sources 会是空的——不止缺 swresample，是整个
+          # avcodec/avformat/avutil 都编不出来（这是 device:arm64 版调试时
+          # 已经确认过的根因）。所以这段替换是必须的，不能删。
+          # x64 模拟器上真正的坑是另一个：is_mac||is_ios 且 current_cpu=="x64"
+          # 这个组合会顺带把 videodsp/vp8dsp 这类 x86 SIMD 优化源码也拉进来，
+          # 触发一个 nasm 静态库没被正确链进最终 framework 的问题。这部分靠
+          # 下面单独一步把 HAVE_X86ASM/HAVE_YASM 关掉来压制，而不是靠不做
+          # 这段替换（不做的话整个 ffmpeg 都编不出来，问题更大）。
+          before = s.count("is_ios")
+          s2 = re.sub(r'\bis_mac\b', '(is_mac || is_ios)', s)
+
+          base_srcs = [
+              "libavutil/audio_fifo.c",
+              "libswresample/audioconvert.c",
+              "libswresample/dither.c",
+              "libswresample/options.c",
+              "libswresample/rematrix.c",
+              "libswresample/resample.c",
+              "libswresample/resample_dsp.c",
+              "libswresample/swresample.c",
+              "libswresample/swresample_frame.c",
+              "libswresample/version.c",
+          ]
+          # resample_dsp.c 里调用 swri_resample_dsp_x86_init(c)，即使
+          # HAVE_X86ASM 已经确认改成了 0，这个符号在这个 fork 里还是
+          # undefined——说明这个 fork 版本的判断条件跟官方 FFmpeg 上游不
+          # 完全一样（可能压根没有 HAVE_X86ASM 这层门槛，只要是 x86 架构
+          # 就无条件调用）。与其继续猜条件到底长什么样，不如直接给这个
+          # 符号提供一个空实现，绕开条件判断本身——反正 HAVE_MMX/SSE 已经
+          # 是 0 了，语义上"什么都不做"就是正确行为。
+          # 函数签名来自官方 resample.h: void swri_resample_dsp_x86_init(ResampleContext *c);
+          x86_stub_path = os.path.join(ff, "autorename_libswresample_x86_stub_init.c")
+          with open(x86_stub_path, "w") as w:
+              w.write(
+                  '#include "libswresample/resample.h"\n'
+                  'void swri_resample_dsp_x86_init(ResampleContext *c) { (void)c; }\n'
+              )
+          # 这两组是 NEON 汇编，仅在 current_cpu == "arm64" 时才会被条件编译进去。
+          # 这次是通用库，arm64 那个切片真的会走到这个分支；x64 那个切片则
+          # 会跳过（current_cpu 对不上），两者共用同一份 gni patch 逻辑没问题。
+          arm_srcs = [
+              "libswresample/aarch64/audio_convert_init.c",
+              "libswresample/aarch64/resample_init.c",
+          ]
+          arm_asm_srcs = [
+              "libswresample/aarch64/audio_convert_neon.S",
+              "libswresample/aarch64/resample.S",
+          ]
+
+          for asm in arm_asm_srcs:
+              if not os.path.exists(os.path.join(ff, asm)):
+                  print(f"❌ 汇编文件不存在: {asm}"); sys.exit(1)
+
+          def make_wrapper(rel):
+              flat = rel.replace("/", "_")
+              wrapper_name = "autorename_" + flat
+              wrapper_path = os.path.join(ff, wrapper_name)
+              with open(wrapper_path, "w") as w:
+                  w.write('#include "%s"\n' % rel)
+              return wrapper_name
+
+          base_wrappers = [make_wrapper(r) for r in base_srcs]
+          arm_wrappers = [make_wrapper(r) for r in arm_srcs]
+
+          lines = []
+          lines.append("")
+          lines.append("# ---- 手动补入 libswresample 与 audio_fifo ----")
+          lines.append("ffmpeg_c_sources += [")
+          for w in base_wrappers:
+              lines.append('  "%s",' % w)
+          lines.append("]")
+          lines.append('if (current_cpu == "x64" || current_cpu == "x86") {')
+          lines.append("  ffmpeg_c_sources += [")
+          lines.append('    "autorename_libswresample_x86_stub_init.c",')
+          lines.append("  ]")
+          lines.append("}")
+          lines.append('if ((is_mac || is_ios) && current_cpu == "arm64") {')
+          lines.append("  ffmpeg_c_sources += [")
+          for w in arm_wrappers:
+              lines.append('    "%s",' % w)
+          for asm in arm_asm_srcs:
+              lines.append('    "%s",' % asm)
+          lines.append("  ]")
+          lines.append("}")
+          lines.append("")
+          extra = "\n".join(lines)
+
+          if not s2.endswith("\n"):
+              s2 += "\n"
+          s2 = s2 + extra
+          open(p, "w").write(s2)
+
+          after_ios = open(p).read().count("is_ios")
+          if after_ios <= before:
+              print("❌ gni 未发生替换，中止"); sys.exit(1)
+          if "autorename_libswresample_swresample.c" not in open(p).read():
+              print("❌ swresample 包装未写入，中止"); sys.exit(1)
+          if "autorename_libswresample_x86_stub_init.c" not in open(p).read():
+              print("❌ x86 stub 包装未写入，中止"); sys.exit(1)
+          if not os.path.exists(os.path.join(ff, "autorename_libswresample_options.c")):
+              print("❌ 包装文件未生成，中止"); sys.exit(1)
+          if "audio_convert_neon.S" not in open(p).read():
+              print("❌ NEON 汇编未写入，中止"); sys.exit(1)
+          print(f"✅ gni 已补 iOS 源 + swresample + NEON 汇编")
+          PYEOF
+
+          echo "########## 修复2a-0b: 启用 CONFIG_SWRESAMPLE（arm64 + x64 都要）##########"
+          for B in Chromium Chrome; do
+            for CPU in arm64 x64; do
+              CH="$FF/chromium/config/$B/ios/$CPU/config.h"
+              [ -f "$CH" ] || continue
+              sed -i '' 's/#define CONFIG_SWRESAMPLE 0/#define CONFIG_SWRESAMPLE 1/' "$CH"
+            done
+          done
+
+          echo "########## 修复2a: ffmpeg 去掉 iOS 的 -lrt ##########"
+          sed -i '' 's/is_posix && !is_mac)/is_posix \&\& !is_mac \&\& !is_ios)/g' "$FF/BUILD.gn"
+
+          echo "########## 修复2a-2: ffmpeg_internal 强制 source_set ##########"
+          python3 - << 'PYEOF'
+          import sys
+          p = "/Users/runner/src/third_party/ffmpeg/BUILD.gn"
+          s = open(p).read()
+          target = 'link_target_type = "static_library"'
+          if target not in s:
+              print("❌ 未找到 link_target_type = static_library，结构变了，中止")
+              sys.exit(1)
+          s = s.replace(
+              target,
+              '# iOS framework 需要 .o 直接展开，改用 source_set\n  link_target_type = "source_set"'
+          )
+          open(p, "w").write(s)
+          v = open(p).read()
+          if 'link_target_type = "source_set"' not in v or 'link_target_type = "static_library"' in v:
+              print("❌ patch 写入后回读校验失败，中止")
+              sys.exit(1)
+          print("✅ ffmpeg_internal 已改为 source_set 并回读确认")
+          PYEOF
+
+          echo "########## 修复2a-3: 给 iOS 也加 _DARWIN_C_SOURCE ##########"
+          python3 - << 'PYEOF'
+          import sys
+          p = "/Users/runner/src/third_party/ffmpeg/BUILD.gn"
+          s = open(p).read()
+          anchor = '  defines = [\n    "HAVE_AV_CONFIG_H",'
+          if anchor in s:
+              s = s.replace(
+                  anchor,
+                  '  defines = [\n    "HAVE_AV_CONFIG_H",\n    "_DARWIN_C_SOURCE",',
+                  1
+              )
+              open(p, "w").write(s)
+              print("✅ 已给 ffmpeg_internal 无条件加 _DARWIN_C_SOURCE")
+          else:
+              print("❌ 未找到锚点，中止")
+              sys.exit(1)
+          PYEOF
+
+          echo "########## 修复2b: recording 补 ffmpeg deps ##########"
+          python3 - << 'PYEOF'
+          p = "/Users/runner/src/modules/recording/BUILD.gn"
+          s = open(p).read()
+          if '//third_party/ffmpeg"' not in s.replace('ffmpeg_dependent_config',''):
+              s = s.replace("deps = [\n  ]", 'deps = [\n    "//third_party/ffmpeg",\n  ]')
+              s = s.replace("deps = [ ]", 'deps = [ "//third_party/ffmpeg" ]')
+              open(p,"w").write(s)
+              print("recording deps 已补 ffmpeg")
+          else:
+              print("recording 已有 ffmpeg deps，跳过")
+          PYEOF
+
+          echo "########## 修复2c: backing_track 补 ffmpeg deps ##########"
+          python3 - << 'PYEOF'
+          p = "/Users/runner/src/modules/backing_track/BUILD.gn"
+          s = open(p).read()
+          import re
+          m = re.search(r'deps = \[(.*?)\]', s, re.S)
+          if m and '//third_party/ffmpeg"' not in m.group(1):
+              s = s.replace(
+                  '"../audio_mixer:audio_mixer_impl",',
+                  '"../audio_mixer:audio_mixer_impl",\n    "//third_party/ffmpeg",'
+              )
+              open(p,"w").write(s)
+              print("backing_track deps 已补 ffmpeg")
+          else:
+              print("backing_track 已有 ffmpeg deps，跳过")
+          PYEOF
+
+          echo "########## 修复4: sdk framework 挂上 recording ##########"
+          python3 - << 'PYEOF'
+          p = "/Users/runner/src/sdk/BUILD.gn"
+          s = open(p).read()
+          if '//modules/recording:recording' not in s:
+              s = s.replace(
+                  '"//modules/backing_track:backing_track",',
+                  '"//modules/backing_track:backing_track",\n          "//modules/recording:recording",'
+              )
+              open(p,"w").write(s)
+              print("sdk framework 已挂 recording")
+          else:
+              print("sdk 已挂 recording，跳过")
+          PYEOF
+
+      - name: 给 aac/ffmpeg/openh264 补 license 声明
+        run: |
+          python3 - << 'PYEOF'
+          p = "/Users/runner/src/tools_webrtc/libs/generate_licenses.py"
+          s = open(p).read()
+
+          anchor = "LIB_TO_LICENSES_DICT = {"
+          if anchor not in s:
+              print("❌ 未找到 LIB_TO_LICENSES_DICT，结构变了，中止")
+              raise SystemExit(1)
+
+          entries = (
+              "    'aac': ['third_party/aac/fdk-aac/NOTICE'],\n"
+              "    'ffmpeg': ['third_party/ffmpeg/LICENSE.md'],\n"
+              "    'openh264': ['third_party/openh264/src/LICENSE'],\n"
+          )
+
+          if "'aac':" in s and "'ffmpeg':" in s and "'openh264':" in s:
+              print("三个 license 声明已存在，跳过")
+          else:
+              s = s.replace(anchor, anchor + "\n" + entries, 1)
+              open(p, "w").write(s)
+              print("✅ 已补 aac/ffmpeg/openh264 license 声明")
+
+          v = open(p).read()
+          for k in ("'aac'", "'ffmpeg'", "'openh264'"):
+              if k not in v:
+                  print(f"❌ {k} 未写入，中止"); raise SystemExit(1)
+          print("✅ 三个声明回读确认")
+          PYEOF
+
+      - name: 保证 FFmpeg avconfig.h 存在（iOS 模拟器 arm64 + x64）
+        run: |
+          FF=/Users/runner/src/third_party/ffmpeg
+          for BRAND in Chromium Chrome; do
+            for CPU in arm64 x64; do
+              DSTDIR="$FF/chromium/config/$BRAND/ios/$CPU/libavutil"
+              [ -d "$FF/chromium/config/$BRAND/ios/$CPU" ] || continue
+              mkdir -p "$DSTDIR"
+              if [ ! -f "$DSTDIR/avconfig.h" ]; then
+                cat > "$DSTDIR/avconfig.h" << 'EOF'
+          /* Generated for iOS Simulator (arm64/x86_64) */
+          #ifndef AVUTIL_AVCONFIG_H
+          #define AVUTIL_AVCONFIG_H
+          #define AV_HAVE_BIGENDIAN 0
+          #define AV_HAVE_FAST_UNALIGNED 1
+          #endif /* AVUTIL_AVCONFIG_H */
+          EOF
+                echo "已补 $DSTDIR/avconfig.h"
+              else
+                echo "$DSTDIR/avconfig.h 已存在"
+              fi
+            done
+          done
+
+      # ============================================================
+      # 编译（增量：有 out/ 缓存时 ninja 只编译变动文件）
+      # 同时传 simulator:arm64 simulator:x64 两个 arch，build_ios_libs.py
+      # 会分别编译两个 cpu 架构，再用 lipo 把它们合并成一个通用（fat）
+      # 二进制，产出的 xcframework 里模拟器那个切片同时支持 Apple
+      # Silicon 和 Intel Mac 的模拟器。
+      # ============================================================
+      - name: 编译 iOS Simulator Universal (arm64+x86_64) XCFramework
+        run: |
+          export PATH="/opt/homebrew/opt/python@3.11/bin:$HOME/depot_tools:$PATH"
+          export PYTHONPATH="$HOME/depot_tools"
+          cd /Users/runner/src
+          python3.11 tools_webrtc/ios/build_ios_libs.py \
+            --output out/ios-sim-universal-release \
+            --arch simulator:arm64 simulator:x64 \
+            --build_config release \
+            --extra-gn-args "treat_warnings_as_errors=false is_component_ffmpeg=false"
+
+      - name: 保存编译中间产物缓存
+        if: success() && steps.cache-out.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: /Users/runner/src/out
+          key: out-ios-simuniversal-${{ hashFiles('DEPS', 'sdk/**/*.gn', 'modules/**/*.gn') }}
+
+      - name: 签名 xcframework（ad-hoc）
+        run: |
+          codesign --sign - --force --deep /Users/runner/src/out/ios-sim-universal-release/WebRTC.xcframework
+          echo "✅ 签名完成"
+          codesign -dv /Users/runner/src/out/ios-sim-universal-release/WebRTC.xcframework
+          echo "---- 确认模拟器切片包含两个架构 ----"
+          lipo -info /Users/runner/src/out/ios-sim-universal-release/WebRTC.xcframework/ios-arm64_x86_64-simulator/WebRTC.framework/WebRTC || \
+            find /Users/runner/src/out/ios-sim-universal-release/WebRTC.xcframework -name "WebRTC" -perm +111 -exec lipo -info {} \;
+
+      # ============================================================
+      # 打包 + 计算 checksum（SPM 必须）
+      # 用独立文件名 WebRTC-ios-simulator-universal，不会覆盖 device 版
+      # 或单独 x64 版的 zip
+      # ============================================================
+      - name: 打包成 zip 并计算 checksum
+        id: package
+        run: |
+          cd /Users/runner/src
+          ls -la out/ios-sim-universal-release
+
+          # 打包前把目录里的 WebRTC.xcframework 改名，避免和其他版本
+          # 解压到同一路径时互相覆盖
+          mv out/ios-sim-universal-release/WebRTC.xcframework out/ios-sim-universal-release/WebRTC-ios-simulator-universal.xcframework
+          zip -ry $GITHUB_WORKSPACE/WebRTC-ios-simulator-universal.xcframework.zip \
+            out/ios-sim-universal-release/WebRTC-ios-simulator-universal.xcframework
+
+          CHECKSUM=$(swift package compute-checksum $GITHUB_WORKSPACE/WebRTC-ios-simulator-universal.xcframework.zip)
+          echo "checksum=$CHECKSUM" >> $GITHUB_OUTPUT
+          echo "✅ Checksum: $CHECKSUM"
+
+      # ============================================================
+      # 仅在打 ios-sim-universal-v*.*.* tag 时发布 GitHub Release
+      # ============================================================
+      - name: 发布到 GitHub Release（打 tag 时）
+        if: startsWith(github.ref, 'refs/tags/ios-sim-universal-v')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          body: |
+            ## WebRTC iOS Simulator Universal (arm64+x86_64) XCFramework ${{ github.ref_name }}
+
+            模拟器切片同时包含 arm64（Apple Silicon Mac）和 x86_64（Intel Mac）两个架构，
+            lipo 合并成一个通用二进制，Xcode 会自动选用当前机器对应的架构。
+            真机版本请用 device:arm64 那个单独的 Release。
+
+            ### 通过 Swift Package Manager 使用
+            ```swift
+            .binaryTarget(
+                name: "WebRTC-iOS-Simulator-Universal",
+                url: "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/WebRTC-ios-simulator-universal.xcframework.zip",
+                checksum: "${{ steps.package.outputs.checksum }}"
+            )
+            ```
+          files: ${{ github.workspace }}/WebRTC-ios-simulator-universal.xcframework.zip
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # 手动触发时只上传 Artifact
+      - name: 上传为 Artifact（手动触发时）
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: WebRTC-iOS-Simulator-Universal-XCFramework
+          path: WebRTC-ios-simulator-universal.xcframework.zip
+          retention-days: 30
